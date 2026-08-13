@@ -236,4 +236,36 @@ InstallSnapshotResponse DecodeInstallSnapshotResponse(const std::string& body) {
     return resp;
 }
 
+std::string EncodeReadRequest(const ReadRequest& req) {
+    std::string out;
+    AppendU8(out, static_cast<uint8_t>(MessageType::kReadRequest));
+    AppendString(out, req.query);
+    return out;
+}
+
+ReadRequest DecodeReadRequest(const std::string& body) {
+    Reader r(body);
+    r.ReadU8();
+    ReadRequest req;
+    req.query = r.ReadString();
+    return req;
+}
+
+std::string EncodeReadResponse(const ReadResponse& resp) {
+    std::string out;
+    AppendU8(out, static_cast<uint8_t>(MessageType::kReadResponse));
+    AppendU8(out, resp.error ? 1 : 0);
+    AppendString(out, resp.result);
+    return out;
+}
+
+ReadResponse DecodeReadResponse(const std::string& body) {
+    Reader r(body);
+    r.ReadU8();
+    ReadResponse resp;
+    resp.error = r.ReadU8() != 0;
+    resp.result = r.ReadString();
+    return resp;
+}
+
 }  // namespace distdb

@@ -15,11 +15,6 @@
 
 namespace distdb {
 
-struct PeerAddress {
-    std::string host;
-    uint16_t port;
-};
-
 enum class Role {
     kFollower,
     kCandidate,
@@ -68,6 +63,14 @@ using SnapshotCallback = std::function<std::string()>;
 // still guarantees only one restore runs at a time.
 using RestoreCallback = std::function<void(const std::string& data)>;
 
+// Serves a read-only query straight from local state, no consensus
+// involved - any node can answer one, not just the leader (consistent
+// with this project's reads-aren't-linearizable stance elsewhere).
+// Should throw on a query error (e.g. bad syntax); HandleReadRequest
+// catches it and reports it back as ReadResponse::error rather than
+// letting it escape.
+using ReadCallback = std::function<std::string(const std::string& query)>;
+
 // A from-scratch Raft node: leader election, heartbeats, real log
 // replication, and log compaction. A client calls Propose() on whichever
 // node is currently the leader; the command is appended to that node's
@@ -96,7 +99,8 @@ class RaftNode {
     RaftNode(NodeId id, uint16_t listen_port, std::map<NodeId, PeerAddress> peers, std::string state_dir,
              ApplyCallback apply_callback = [](LogIndex, const std::string&) {},
              SnapshotCallback snapshot_callback = [] { return std::string(); },
-             RestoreCallback restore_callback = [](const std::string&) {});
+             RestoreCallback restore_callback = [](const std::string&) {},
+             ReadCallback read_callback = [](const std::string&) { return std::string(); });
 
     // Starts the RPC listener and the background election/heartbeat/
     // replication ticker (each on its own thread) and returns - this
@@ -132,6 +136,7 @@ class RaftNode {
     AppendEntriesResponse HandleAppendEntries(const AppendEntriesRequest& req);
     ClientResponse HandleClientRequest(const ClientRequest& req);
     InstallSnapshotResponse HandleInstallSnapshot(const InstallSnapshotRequest& req);
+    ReadResponse HandleReadRequest(const ReadRequest& req);
 
     void TickerLoop();
     void StartElection();
@@ -151,6 +156,7 @@ class RaftNode {
     ApplyCallback apply_callback_;
     SnapshotCallback snapshot_callback_;
     RestoreCallback restore_callback_;
+    ReadCallback read_callback_;
 
     mutable std::mutex mutex_;
     // Serializes HandleInstallSnapshot calls against each other (but not

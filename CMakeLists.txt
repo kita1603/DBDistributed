@@ -47,6 +47,7 @@ add_library(distdb_raft
     src/raft/persistent_state.cpp
     src/raft/log.cpp
     src/raft/node.cpp
+    src/raft/client.cpp
 )
 target_include_directories(distdb_raft PUBLIC src)
 target_link_libraries(distdb_raft PUBLIC Threads::Threads)
@@ -54,5 +55,11 @@ if(WIN32)
     target_link_libraries(distdb_raft PUBLIC ws2_32)
 endif()
 
+add_library(distdb_shard
+    src/shard/routing.cpp
+)
+target_include_directories(distdb_shard PUBLIC src)
+target_link_libraries(distdb_shard PUBLIC distdb_raft)
+
 add_executable(raftnode src/raft_main.cpp)
-target_link_libraries(raftnode PRIVATE distdb_raft distdb_storage distdb_sql)
+target_link_libraries(raftnode PRIVATE distdb_raft distdb_storage distdb_sql distdb_shard)

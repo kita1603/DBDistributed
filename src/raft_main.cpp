@@ -10,7 +10,9 @@
 #include <variant>
 #include <vector>
 
+#include "raft/client.h"
 #include "raft/node.h"
+#include "shard/routing.h"
 #include "sql/ast.h"
 #include "sql/executor.h"
 #include "sql/lexer.h"
@@ -18,6 +20,12 @@
 #include "storage/engine.h"
 
 namespace {
+
+// Timeout for a request that has to go over the network to a *different*
+// shard's cluster - longer than a within-shard ProposeOrForward's default,
+// since it may itself involve that shard following its own leader
+// redirects before replying.
+constexpr int kCrossShardTimeoutMs = 4000;
 
 // A snapshot is just every key/value pair the local StorageEngine
 // currently holds, length-prefixed the same way EncodeRow/DecodeRow
@@ -65,27 +73,6 @@ std::vector<std::pair<std::string, std::string>> DecodeSnapshot(const std::strin
     return result;
 }
 
-// Parses "2=127.0.0.1:9002,3=127.0.0.1:9003" into a peer map (this
-// node's own id is not included).
-std::map<distdb::NodeId, distdb::PeerAddress> ParsePeers(const std::string& spec) {
-    std::map<distdb::NodeId, distdb::PeerAddress> peers;
-    std::istringstream stream(spec);
-    std::string entry;
-    while (std::getline(stream, entry, ',')) {
-        if (entry.empty()) continue;
-        size_t eq = entry.find('=');
-        size_t colon = entry.find(':', eq == std::string::npos ? 0 : eq);
-        if (eq == std::string::npos || colon == std::string::npos) {
-            throw std::runtime_error("bad peer spec: " + entry);
-        }
-        auto id = static_cast<distdb::NodeId>(std::stoul(entry.substr(0, eq)));
-        std::string host = entry.substr(eq + 1, colon - eq - 1);
-        auto port = static_cast<uint16_t>(std::stoul(entry.substr(colon + 1)));
-        peers[id] = {host, port};
-    }
-    return peers;
-}
-
 const char* RoleName(distdb::Role role) {
     switch (role) {
         case distdb::Role::kFollower:
@@ -98,15 +85,32 @@ const char* RoleName(distdb::Role role) {
     return "?";
 }
 
+void PrintClientResponse(const distdb::ClientResponse& resp) {
+    if (resp.success) {
+        std::cout << "OK (committed at index " << resp.index << ", via leader node " << resp.leader_hint << ")\n";
+        return;
+    }
+    std::cout << "FAILED";
+    if (resp.not_leader && resp.leader_hint != 0) {
+        std::cout << " (best known leader is node " << resp.leader_hint << ", but still failed";
+        if (!resp.error.empty()) std::cout << ": " << resp.error;
+        std::cout << " - retry)";
+    } else if (!resp.error.empty()) {
+        std::cout << " (" << resp.error << ")";
+    }
+    std::cout << "\n";
+}
+
 void PrintHelp() {
     std::cout << "Enter SQL statements (CREATE TABLE / INSERT / SELECT / UPDATE / DELETE).\n"
-                 "Writes (CREATE/INSERT/UPDATE/DELETE) are replicated through Raft - proposed\n"
-                 "to the log and only committed once a majority of nodes hold them, so they\n"
-                 "only succeed when sent to the current leader. SELECT reads straight from\n"
-                 "this node's local storage - not linearizable, so a follower can be a little\n"
-                 "behind the leader if you read right after a write.\n"
+                 "CREATE TABLE is broadcast to every shard. INSERT, and any SELECT/UPDATE/\n"
+                 "DELETE whose WHERE pins the primary key with '=', is routed to the one\n"
+                 "shard that owns it (replicated through Raft the same as a single-shard\n"
+                 "cluster, forwarding over the network first if that shard isn't this node's).\n"
+                 "A statement that can't be pinned to one shard (no WHERE <pk> = ...) is\n"
+                 "rejected for now - cross-shard table scans aren't implemented yet.\n"
                  "\n"
-                 "  status   show role / term / current leader hint\n"
+                 "  status   show role / term / current leader hint / shard id\n"
                  "  help\n"
                  "  exit\n";
 }
@@ -119,79 +123,80 @@ int main(int argc, char** argv) {
     // buffer indefinitely since this process never exits on its own.
     std::cout.setf(std::ios::unitbuf);
 
-    if (argc < 4) {
-        std::cerr << "usage: raftnode <id> <listen-port> <peers> [state-dir]\n"
-                     "  peers: \"2=127.0.0.1:9002,3=127.0.0.1:9003\" (this node's own id excluded)\n";
+    if (argc < 5) {
+        std::cerr << "usage: raftnode <node-id> <shard-id> <listen-port> <routing-table-path> [state-dir]\n";
         return 1;
     }
 
     try {
-        auto id = static_cast<distdb::NodeId>(std::stoul(argv[1]));
-        auto port = static_cast<uint16_t>(std::stoul(argv[2]));
-        auto peers = ParsePeers(argv[3]);
-        std::string state_dir = argc > 4 ? argv[4] : ".";
+        auto node_id = static_cast<distdb::NodeId>(std::stoul(argv[1]));
+        auto shard_id = static_cast<distdb::ShardId>(std::stoul(argv[2]));
+        auto port = static_cast<uint16_t>(std::stoul(argv[3]));
+        std::string routing_path = argv[4];
+        std::string state_dir = argc > 5 ? argv[5] : ".";
         std::filesystem::create_directories(state_dir);
+
+        distdb::RoutingTable routing;
+        routing.LoadFromFile(routing_path);
+
+        const auto& my_shard = routing.Shard(shard_id);
+        if (my_shard.peers.find(node_id) == my_shard.peers.end()) {
+            throw std::runtime_error("node " + std::to_string(node_id) + " is not listed as a peer of shard " +
+                                      std::to_string(shard_id) + " in " + routing_path);
+        }
+        std::map<distdb::NodeId, distdb::PeerAddress> peers_in_shard = my_shard.peers;
+        peers_in_shard.erase(node_id);  // RaftNode's peers_ convention: exclude self
 
         distdb::StorageEngine engine(state_dir + "/kv");
         engine.Open();
         distdb::SqlExecutor sql(engine);
 
-        // StorageEngine/SqlExecutor have no locking of their own (Phase
-        // 1 only ever used them from a single thread). Now that they're
-        // reached from several: the REPL's own thread (SELECT), whatever
-        // thread is applying a just-committed entry, and whatever thread
-        // is building or installing a snapshot - all access goes through
-        // this one mutex.
+        // StorageEngine/SqlExecutor have no locking of their own; this
+        // one mutex guards every access, from the REPL thread, the apply
+        // path, the snapshot path, and now local reads served for a
+        // remote shard's SendReadRequest.
         std::mutex engine_mutex;
 
-        // Every node applies the exact same sequence of committed SQL
-        // statements to its own StorageEngine, which is what makes them
-        // end up with identical data. A statement that fails here (e.g.
-        // a duplicate primary key) fails the same way on every node,
-        // since they've all applied the identical sequence of prior
-        // statements - so this never causes replicas to diverge. Must
-        // not let the exception escape: see the ApplyCallback contract
-        // in raft/node.h.
-        auto apply_callback = [&sql, &engine_mutex, id](distdb::LogIndex index, const std::string& command) {
-            std::cout << "[node " << id << "] applying #" << index << ": " << command << "\n";
+        auto apply_callback = [&sql, &engine_mutex, node_id](distdb::LogIndex index, const std::string& command) {
+            std::cout << "[node " << node_id << "] applying #" << index << ": " << command << "\n";
             std::lock_guard<std::mutex> lock(engine_mutex);
             try {
                 sql.Execute(command);
             } catch (const std::exception& e) {
-                std::cout << "[node " << id << "] apply error: " << e.what() << "\n";
+                std::cout << "[node " << node_id << "] apply error: " << e.what() << "\n";
             }
         };
 
-        // Called when a badly-lagging follower needs this node's (the
-        // leader's) entire current state, because the log entries it
-        // would otherwise need have already been compacted away.
-        auto snapshot_callback = [&engine, &engine_mutex, id]() -> std::string {
+        auto snapshot_callback = [&engine, &engine_mutex, node_id]() -> std::string {
             std::lock_guard<std::mutex> lock(engine_mutex);
             auto kvs = engine.Scan("");
-            std::cout << "[node " << id << "] building snapshot: " << kvs.size() << " key(s)\n";
+            std::cout << "[node " << node_id << "] building snapshot: " << kvs.size() << " key(s)\n";
             return EncodeSnapshot(kvs);
         };
 
-        // Called on the receiving end of the above: replace this node's
-        // entire state with what's in the snapshot, discarding whatever
-        // was here before - a wholesale replacement, not a merge.
-        auto restore_callback = [&engine, &engine_mutex, id](const std::string& data) {
+        auto restore_callback = [&engine, &engine_mutex, node_id](const std::string& data) {
             std::lock_guard<std::mutex> lock(engine_mutex);
             auto kvs = DecodeSnapshot(data);
-            std::cout << "[node " << id << "] installing snapshot: " << kvs.size() << " key(s)\n";
+            std::cout << "[node " << node_id << "] installing snapshot: " << kvs.size() << " key(s)\n";
             try {
                 engine.Reset();
                 for (const auto& [key, value] : kvs) {
                     engine.Put(key, value);
                 }
             } catch (const std::exception& e) {
-                std::cout << "[node " << id << "] snapshot install FAILED: " << e.what() << "\n";
+                std::cout << "[node " << node_id << "] snapshot install FAILED: " << e.what() << "\n";
             }
         };
 
-        distdb::RaftNode node(id, port, peers, state_dir, apply_callback, snapshot_callback, restore_callback);
+        auto read_callback = [&sql, &engine_mutex](const std::string& query) -> std::string {
+            std::lock_guard<std::mutex> lock(engine_mutex);
+            return sql.Execute(query);
+        };
 
-        std::cout << "raftnode " << id << " listening on port " << port << ", peers: " << argv[3] << "\n";
+        distdb::RaftNode node(node_id, port, peers_in_shard, state_dir, apply_callback, snapshot_callback,
+                               restore_callback, read_callback);
+
+        std::cout << "raftnode " << node_id << " (shard " << shard_id << ") listening on port " << port << "\n";
         node.Run();
         PrintHelp();
 
@@ -218,14 +223,11 @@ int main(int argc, char** argv) {
                 PrintHelp();
                 continue;
             } else if (first_word == "status") {
-                std::cout << "role=" << RoleName(node.role()) << " term=" << node.current_term()
-                          << " leader_hint=" << node.leader_hint() << "\n";
+                std::cout << "shard=" << shard_id << " role=" << RoleName(node.role())
+                          << " term=" << node.current_term() << " leader_hint=" << node.leader_hint() << "\n";
                 continue;
             }
 
-            // Anything else is a SQL statement. Parse it first just to
-            // classify read vs. write - a syntax error is caught here
-            // without ever being proposed to the log.
             distdb::Statement parsed;
             try {
                 distdb::Parser parser(distdb::Tokenize(line));
@@ -235,37 +237,78 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            if (std::holds_alternative<distdb::SelectStatement>(parsed)) {
-                // Read-only: served straight from local storage, no
-                // consensus round needed. Still needs engine_mutex - a
-                // commit could be getting applied by another thread
-                // concurrently.
+            if (std::holds_alternative<distdb::CreateTableStatement>(parsed)) {
+                // Schema is DDL, not row data - any shard could end up
+                // holding rows for this table, so every shard needs an
+                // identical copy of it, not just the one (if any) that
+                // would own some specific key.
+                size_t ok_count = 0;
+                std::vector<std::string> failures;
+                for (auto sid : routing.AllShardIds()) {
+                    distdb::ClientResponse resp;
+                    if (sid == shard_id) {
+                        resp = node.ProposeOrForward(line);
+                    } else {
+                        try {
+                            resp = distdb::SendClientRequest(routing.Shard(sid).peers, line, kCrossShardTimeoutMs);
+                        } catch (const std::exception& e) {
+                            resp = {false, 0, true, 0, e.what()};
+                        }
+                    }
+                    if (resp.success) {
+                        ok_count++;
+                    } else {
+                        failures.push_back("shard " + std::to_string(sid) + ": " + resp.error);
+                    }
+                }
+                if (failures.empty()) {
+                    std::cout << "OK (created on " << ok_count << " shard(s))\n";
+                } else {
+                    std::cout << "PARTIAL (" << ok_count << " shard(s) ok):";
+                    for (const auto& f : failures) std::cout << " [" << f << "]";
+                    std::cout << "\n";
+                }
+                continue;
+            }
+
+            auto key = sql.TryExtractRowKey(parsed);
+            if (!key) {
+                std::cout << "ERROR: cannot route this statement to a single shard (no WHERE <primary-key> = ... "
+                             "condition) - cross-shard table scans aren't supported yet\n";
+                continue;
+            }
+
+            const distdb::ShardRange* target = nullptr;
+            try {
+                target = &routing.ShardFor(*key);
+            } catch (const std::exception& e) {
+                std::cout << "ERROR: " << e.what() << "\n";
+                continue;
+            }
+
+            bool is_select = std::holds_alternative<distdb::SelectStatement>(parsed);
+            bool local = target->id == shard_id;
+
+            if (is_select) {
                 try {
-                    std::lock_guard<std::mutex> lock(engine_mutex);
-                    std::cout << sql.Execute(line) << "\n";
+                    std::string result;
+                    if (local) {
+                        std::lock_guard<std::mutex> lock(engine_mutex);
+                        result = sql.Execute(line);
+                    } else {
+                        result = distdb::SendReadRequest(target->peers, line, kCrossShardTimeoutMs);
+                    }
+                    std::cout << result << "\n";
                 } catch (const std::exception& e) {
                     std::cout << "ERROR: " << e.what() << "\n";
                 }
+            } else if (local) {
+                PrintClientResponse(node.ProposeOrForward(line));
             } else {
-                // ProposeOrForward means this REPL doesn't need to be
-                // pointed at the leader itself: if this node isn't it,
-                // the request gets forwarded over the network to
-                // whichever node is (or several, if that guess is
-                // stale) before the result comes back.
-                auto resp = node.ProposeOrForward(line);
-                if (resp.success) {
-                    std::cout << "OK (committed at index " << resp.index << ", via leader node "
-                               << resp.leader_hint << ")\n";
-                } else {
-                    std::cout << "FAILED";
-                    if (resp.not_leader && resp.leader_hint != 0) {
-                        std::cout << " (best known leader is node " << resp.leader_hint << ", but still failed";
-                        if (!resp.error.empty()) std::cout << ": " << resp.error;
-                        std::cout << " - retry)";
-                    } else if (!resp.error.empty()) {
-                        std::cout << " (" << resp.error << ")";
-                    }
-                    std::cout << "\n";
+                try {
+                    PrintClientResponse(distdb::SendClientRequest(target->peers, line, kCrossShardTimeoutMs));
+                } catch (const std::exception& e) {
+                    std::cout << "ERROR: " << e.what() << "\n";
                 }
             }
         }

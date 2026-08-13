@@ -3,7 +3,7 @@
 Distributed SQL database, built incrementally from scratch in C++ for learning
 purposes. See the phase breakdown below for where this stands.
 
-## Phase 1 (current): single-node storage engine
+## Phase 1: single-node storage engine
 
 - `src/storage/wal.*` — append-only write-ahead log with per-record CRC32
   checksums, so a torn write at the tail (crash mid-append) is detected and
@@ -208,7 +208,7 @@ timeout - commonly tens of seconds - which from the caller's side just looks
 like the whole command froze. Multi-machine testing is exactly where this
 would otherwise bite.
 
-Not yet implemented (later phases): sharding, distributed transactions.
+Not yet implemented (later phases): distributed transactions.
 
 Known simplifications (fine for learning, called out for later): `MaybeCompact`
 merges every current SSTable at once rather than a leveled/tiered policy over
@@ -219,6 +219,86 @@ tiny (4) so they're easy to trigger by hand instead of being sized for real
 data volumes; SQL and raw KV commands share one key space, so a raw `put`
 under `__row__/...`/`__schema__/...` could corrupt a table with no
 validation stopping it.
+
+## Phase 3: sharding (`src/shard/`)
+
+A single Raft group's write throughput and storage capacity are both capped
+by one machine (every replica holds a *full* copy of everything, and only
+the leader accepts writes). Sharding splits the whole key space into
+disjoint, contiguous ranges - each with its own completely independent Raft
+group (its own leader, its own set of replicas, its own log/snapshots) -
+so both limits scale with the number of shards instead of staying fixed.
+
+- `routing.h/.cpp` — `RoutingTable`: a static, hand-written text file
+  mapping `[start_key, end_key)` ranges to a shard id and that shard's own
+  peer list (reusing the same `id=host:port,...` syntax as a single Raft
+  group's peers). `ShardFor(key)` finds the owning shard via
+  `std::upper_bound` over the sorted boundaries - the exact same "sorted
+  array + binary search" pattern `SSTableReader` uses to find which block
+  holds a key, just one level up: which shard, instead of which offset in
+  one file. Loaded once at startup and never changes - a dynamic version
+  (splitting/merging shards, rebalancing) would need this to become itself
+  replicated across the cluster rather than a local file; out of scope here.
+- `SqlExecutor::TryExtractRowKey` (in `sql/`) - given a parsed statement,
+  returns the exact row key it touches if that's determinable without a
+  full table scan: an `INSERT` (the primary key value is right there in the
+  statement) or a `SELECT`/`UPDATE`/`DELETE` whose `WHERE` pins the primary
+  key with `=`. Returns nothing for `CREATE TABLE` (it's schema, not a row -
+  see below) or a `WHERE` that doesn't pin the primary key (a full table
+  scan, e.g. no filter or one on a non-key column) - `raft_main.cpp` must
+  then decide what to do without a single shard to route to.
+- `raft/client.h/.cpp` - `SendClientRequest`/`SendReadRequest`: standalone
+  helpers that reach a Raft cluster the calling process *isn't* a member of
+  (a different shard), given only its peer addresses from the routing
+  table. `SendClientRequest` (writes) follows leader redirects the same way
+  `RaftNode::ProposeOrForward` does for a member, just starting from a bare
+  network call instead of an in-process `Propose()`. `SendReadRequest`
+  (reads) doesn't need the leader specifically - it just tries peers in
+  turn until one answers - so it goes through a new `ReadRequest`/
+  `ReadCallback` RPC that bypasses Raft entirely: `RaftNode` doesn't parse
+  SQL, it just hands the opaque query string to `ReadCallback` and returns
+  whatever comes back, with no leader check or lock on Raft state at all.
+- `raft_main.cpp` dispatch: `raftnode <node-id> <shard-id> <port>
+  <routing-table-path> [state-dir]` - a node's peers now come from the
+  routing table (`Shard(shard_id).peers`, minus itself) instead of a
+  separate CLI argument. `CREATE TABLE` is DDL, not row data - any shard
+  could end up holding rows for that table, so it's proposed to *every*
+  shard via a loop (locally through `ProposeOrForward` for this node's own
+  shard, `SendClientRequest` for the rest), not routed to just one.
+  Everything else calls `TryExtractRowKey` first: if it returns a key,
+  `RoutingTable::ShardFor` picks the one shard responsible, and the
+  statement goes through the same local/remote split (`ProposeOrForward`
+  or `SendClientRequest` for writes; a direct local `Execute` or
+  `SendReadRequest` for a `SELECT`) depending on whether that shard happens
+  to be this node's own. If `TryExtractRowKey` returns nothing, the
+  statement is rejected with a clear error rather than silently run against
+  only the local shard's data - a full cross-shard table scan (fan out to
+  every shard, merge results) isn't implemented yet.
+
+Verified by hand: a 2-shard, 6-node cluster (3 replicas each, independent
+elections - confirmed by different leaders on each shard) splits the key
+space at `__row__/m`. `CREATE TABLE` sent to either shard shows up on both.
+An `INSERT` for a table whose keys fall in the *other* shard, sent to a
+node in this shard, is transparently forwarded and comes back showing the
+other shard's leader committed it; a `SELECT` for that same row, sent to a
+third node in yet another shard, is forwarded as a read and returns the
+right value. A `SELECT` with no primary-key filter is rejected with a clear
+message instead of silently returning only whatever the local shard has.
+
+Known simplifications: routing is entirely static (a hand-edited text file,
+no splitting/merging/rebalancing, no replication of the routing table
+itself - see `routing.h`'s doc comment); no cross-shard scatter/gather, so
+`SELECT`/`UPDATE`/`DELETE` without a primary-key equality filter are
+rejected outright rather than fanned out to every shard and merged;
+`SendClientRequest`'s redirect-following loop duplicates
+`RaftNode::ProposeOrForward`'s logic rather than sharing it (the latter can
+also propose locally when this process *is* a member, which the standalone
+version never can, so unifying them isn't quite free); a statement that
+updates exactly one row is atomic (it's a single `Propose()` on one shard),
+but nothing here provides atomicity *across* shards (e.g. a single
+statement's effects spanning two rows in two different shards) - that
+would need real distributed transactions (2PC/Percolator-style), which is
+Phase 4, not this one.
 
 ## Build
 

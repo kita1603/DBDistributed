@@ -38,13 +38,14 @@ int RandomElectionTimeoutMs() {
 
 RaftNode::RaftNode(NodeId id, uint16_t listen_port, std::map<NodeId, PeerAddress> peers, std::string state_dir,
                     ApplyCallback apply_callback, SnapshotCallback snapshot_callback,
-                    RestoreCallback restore_callback)
+                    RestoreCallback restore_callback, ReadCallback read_callback)
     : id_(id),
       listen_port_(listen_port),
       peers_(std::move(peers)),
       apply_callback_(std::move(apply_callback)),
       snapshot_callback_(std::move(snapshot_callback)),
       restore_callback_(std::move(restore_callback)),
+      read_callback_(std::move(read_callback)),
       state_(state_dir + "/raft_state_" + std::to_string(id) + ".txt"),
       log_(state_dir + "/raft_log_" + std::to_string(id) + ".bin"),
       transport_(listen_port) {
@@ -90,6 +91,8 @@ std::string RaftNode::HandleMessage(const std::string& request_body) {
             return EncodeClientResponse(HandleClientRequest(DecodeClientRequest(request_body)));
         case MessageType::kInstallSnapshotRequest:
             return EncodeInstallSnapshotResponse(HandleInstallSnapshot(DecodeInstallSnapshotRequest(request_body)));
+        case MessageType::kReadRequest:
+            return EncodeReadResponse(HandleReadRequest(DecodeReadRequest(request_body)));
         default:
             throw std::runtime_error("unexpected message type received");
     }
@@ -467,6 +470,18 @@ InstallSnapshotResponse RaftNode::HandleInstallSnapshot(const InstallSnapshotReq
         commit_cv_.notify_all();
     }
     return {state_.current_term()};
+}
+
+ReadResponse RaftNode::HandleReadRequest(const ReadRequest& req) {
+    // No leader check, no lock on Raft state at all: a read doesn't
+    // touch the log or role, just the state machine, and read_callback_
+    // is responsible for its own synchronization against concurrent
+    // applies (see the engine_mutex wiring in raft_main.cpp).
+    try {
+        return {false, read_callback_(req.query)};
+    } catch (const std::exception& e) {
+        return {true, e.what()};
+    }
 }
 
 bool RaftNode::Propose(const std::string& command, LogIndex* out_index, int timeout_ms) {

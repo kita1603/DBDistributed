@@ -52,6 +52,19 @@ std::vector<std::string> DecodeRow(const std::string& blob) {
     return values;
 }
 
+// Finds an equality condition on `schema`'s primary key column within
+// `where`, if any - shared by TryExtractRowKey's SELECT/UPDATE/DELETE
+// cases below.
+std::optional<std::string> FindPkEquality(const TableSchema& schema, const std::vector<Condition>& where) {
+    int pk_idx = schema.PrimaryKeyIndex();
+    if (pk_idx < 0) return std::nullopt;
+    const std::string& pk_name = schema.columns[pk_idx].name;
+    for (const auto& cond : where) {
+        if (cond.column == pk_name && cond.op == CompareOp::kEq) return cond.literal;
+    }
+    return std::nullopt;
+}
+
 }  // namespace
 
 SqlExecutor::SqlExecutor(StorageEngine& engine) : engine_(engine) {}
@@ -62,7 +75,7 @@ std::string SqlExecutor::RowKey(const std::string& table_name, const std::string
     return RowPrefix(table_name) + pk_value;
 }
 
-TableSchema SqlExecutor::LoadSchema(const std::string& table_name) {
+TableSchema SqlExecutor::LoadSchema(const std::string& table_name) const {
     auto blob = engine_.Get(SchemaKey(table_name));
     if (!blob) throw std::runtime_error("no such table: " + table_name);
     return TableSchema::Deserialize(*blob);
@@ -132,6 +145,38 @@ std::string SqlExecutor::Execute(const std::string& sql) {
                 return ExecuteUpdate(s);
             } else {
                 return ExecuteDelete(s);
+            }
+        },
+        stmt);
+}
+
+std::optional<std::string> SqlExecutor::TryExtractRowKey(const Statement& stmt) const {
+    return std::visit(
+        [this](auto&& s) -> std::optional<std::string> {
+            using T = std::decay_t<decltype(s)>;
+            try {
+                if constexpr (std::is_same_v<T, InsertStatement>) {
+                    TableSchema schema = LoadSchema(s.table_name);
+                    int pk_idx = schema.PrimaryKeyIndex();
+                    const std::string& pk_name = schema.columns[pk_idx].name;
+                    for (size_t i = 0; i < s.columns.size(); i++) {
+                        if (s.columns[i] == pk_name) return RowKey(s.table_name, s.values[i]);
+                    }
+                    return std::nullopt;  // INSERT didn't name the pk column - ExecuteInsert will report that
+                } else if constexpr (std::is_same_v<T, SelectStatement> || std::is_same_v<T, UpdateStatement> ||
+                                      std::is_same_v<T, DeleteStatement>) {
+                    TableSchema schema = LoadSchema(s.table_name);
+                    auto pk = FindPkEquality(schema, s.where);
+                    if (pk) return RowKey(s.table_name, *pk);
+                    return std::nullopt;  // no WHERE <pk> = ... - touches the whole table
+                } else {
+                    return std::nullopt;  // CreateTableStatement - no single row, needs every shard
+                }
+            } catch (...) {
+                // e.g. the table doesn't exist - let the normal
+                // execution path (which the caller falls back to)
+                // report that error instead of this one going unnoticed.
+                return std::nullopt;
             }
         },
         stmt);

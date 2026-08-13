@@ -86,6 +86,19 @@ struct InstallSnapshotResponse {
     Term term = 0;
 };
 
+// A read-only query, opaque to Raft (like ClientRequest's command). Reads
+// don't need consensus - any node can serve one straight from its local
+// state machine (see RaftNode's ReadCallback) - so unlike ClientRequest
+// there's no leader check or redirect involved at all.
+struct ReadRequest {
+    std::string query;
+};
+
+struct ReadResponse {
+    bool error = false;
+    std::string result;  // the query's result on success, or an error message when `error`
+};
+
 enum class MessageType : uint8_t {
     kRequestVoteRequest = 1,
     kRequestVoteResponse = 2,
@@ -95,6 +108,8 @@ enum class MessageType : uint8_t {
     kClientResponse = 6,
     kInstallSnapshotRequest = 7,
     kInstallSnapshotResponse = 8,
+    kReadRequest = 9,
+    kReadResponse = 10,
 };
 
 // Each Encode* function produces a type-tagged binary buffer:
@@ -109,6 +124,8 @@ std::string EncodeClientRequest(const ClientRequest& req);
 std::string EncodeClientResponse(const ClientResponse& resp);
 std::string EncodeInstallSnapshotRequest(const InstallSnapshotRequest& req);
 std::string EncodeInstallSnapshotResponse(const InstallSnapshotResponse& resp);
+std::string EncodeReadRequest(const ReadRequest& req);
+std::string EncodeReadResponse(const ReadResponse& resp);
 
 // Throws std::runtime_error if `body` is too short for its declared
 // fields (a corrupt or truncated message).
@@ -121,5 +138,7 @@ ClientRequest DecodeClientRequest(const std::string& body);
 ClientResponse DecodeClientResponse(const std::string& body);
 InstallSnapshotRequest DecodeInstallSnapshotRequest(const std::string& body);
 InstallSnapshotResponse DecodeInstallSnapshotResponse(const std::string& body);
+ReadRequest DecodeReadRequest(const std::string& body);
+ReadResponse DecodeReadResponse(const std::string& body);
 
 }  // namespace distdb
