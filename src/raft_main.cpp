@@ -1,0 +1,188 @@
+#include <cstdint>
+#include <filesystem>
+#include <iostream>
+#include <map>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <variant>
+
+#include "raft/node.h"
+#include "sql/ast.h"
+#include "sql/executor.h"
+#include "sql/lexer.h"
+#include "sql/parser.h"
+#include "storage/engine.h"
+
+namespace {
+
+// Parses "2=127.0.0.1:9002,3=127.0.0.1:9003" into a peer map (this
+// node's own id is not included).
+std::map<distdb::NodeId, distdb::PeerAddress> ParsePeers(const std::string& spec) {
+    std::map<distdb::NodeId, distdb::PeerAddress> peers;
+    std::istringstream stream(spec);
+    std::string entry;
+    while (std::getline(stream, entry, ',')) {
+        if (entry.empty()) continue;
+        size_t eq = entry.find('=');
+        size_t colon = entry.find(':', eq == std::string::npos ? 0 : eq);
+        if (eq == std::string::npos || colon == std::string::npos) {
+            throw std::runtime_error("bad peer spec: " + entry);
+        }
+        auto id = static_cast<distdb::NodeId>(std::stoul(entry.substr(0, eq)));
+        std::string host = entry.substr(eq + 1, colon - eq - 1);
+        auto port = static_cast<uint16_t>(std::stoul(entry.substr(colon + 1)));
+        peers[id] = {host, port};
+    }
+    return peers;
+}
+
+const char* RoleName(distdb::Role role) {
+    switch (role) {
+        case distdb::Role::kFollower:
+            return "follower";
+        case distdb::Role::kCandidate:
+            return "candidate";
+        case distdb::Role::kLeader:
+            return "leader";
+    }
+    return "?";
+}
+
+void PrintHelp() {
+    std::cout << "Enter SQL statements (CREATE TABLE / INSERT / SELECT / UPDATE / DELETE).\n"
+                 "Writes (CREATE/INSERT/UPDATE/DELETE) are replicated through Raft - proposed\n"
+                 "to the log and only committed once a majority of nodes hold them, so they\n"
+                 "only succeed when sent to the current leader. SELECT reads straight from\n"
+                 "this node's local storage - not linearizable, so a follower can be a little\n"
+                 "behind the leader if you read right after a write.\n"
+                 "\n"
+                 "  status   show role / term / current leader hint\n"
+                 "  help\n"
+                 "  exit\n";
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    // stdout is often redirected to a log file when running several
+    // nodes as background processes; without unitbuf, output sits in a
+    // buffer indefinitely since this process never exits on its own.
+    std::cout.setf(std::ios::unitbuf);
+
+    if (argc < 4) {
+        std::cerr << "usage: raftnode <id> <listen-port> <peers> [state-dir]\n"
+                     "  peers: \"2=127.0.0.1:9002,3=127.0.0.1:9003\" (this node's own id excluded)\n";
+        return 1;
+    }
+
+    try {
+        auto id = static_cast<distdb::NodeId>(std::stoul(argv[1]));
+        auto port = static_cast<uint16_t>(std::stoul(argv[2]));
+        auto peers = ParsePeers(argv[3]);
+        std::string state_dir = argc > 4 ? argv[4] : ".";
+        std::filesystem::create_directories(state_dir);
+
+        distdb::StorageEngine engine(state_dir + "/kv");
+        engine.Open();
+        distdb::SqlExecutor sql(engine);
+
+        // Every node applies the exact same sequence of committed SQL
+        // statements to its own StorageEngine, which is what makes them
+        // end up with identical data. A statement that fails here (e.g.
+        // a duplicate primary key) fails the same way on every node,
+        // since they've all applied the identical sequence of prior
+        // statements - so this never causes replicas to diverge. Must
+        // not let the exception escape: see the ApplyCallback contract
+        // in raft/node.h.
+        distdb::RaftNode node(id, port, peers, state_dir,
+                               [&sql, id](distdb::LogIndex index, const std::string& command) {
+                                   std::cout << "[node " << id << "] applying #" << index << ": " << command << "\n";
+                                   try {
+                                       sql.Execute(command);
+                                   } catch (const std::exception& e) {
+                                       std::cout << "[node " << id << "] apply error: " << e.what() << "\n";
+                                   }
+                               });
+
+        std::cout << "raftnode " << id << " listening on port " << port << ", peers: " << argv[3] << "\n";
+        node.Run();
+        PrintHelp();
+
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            // Some redirected-stdin setups (e.g. a .NET StreamWriter
+            // piping into this process, as used by this project's test
+            // scripts) emit a UTF-8 BOM before the very first byte
+            // written. Strip it defensively so it doesn't get parsed as
+            // part of the first command.
+            if (line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF &&
+                static_cast<unsigned char>(line[1]) == 0xBB && static_cast<unsigned char>(line[2]) == 0xBF) {
+                line.erase(0, 3);
+            }
+
+            std::istringstream iss(line);
+            std::string first_word;
+            iss >> first_word;
+            if (first_word.empty()) continue;
+
+            if (first_word == "exit" || first_word == "quit") {
+                break;
+            } else if (first_word == "help") {
+                PrintHelp();
+                continue;
+            } else if (first_word == "status") {
+                std::cout << "role=" << RoleName(node.role()) << " term=" << node.current_term()
+                          << " leader_hint=" << node.leader_hint() << "\n";
+                continue;
+            }
+
+            // Anything else is a SQL statement. Parse it first just to
+            // classify read vs. write - a syntax error is caught here
+            // without ever being proposed to the log.
+            distdb::Statement parsed;
+            try {
+                distdb::Parser parser(distdb::Tokenize(line));
+                parsed = parser.ParseStatement();
+            } catch (const std::exception& e) {
+                std::cout << "ERROR: " << e.what() << "\n";
+                continue;
+            }
+
+            if (std::holds_alternative<distdb::SelectStatement>(parsed)) {
+                // Read-only: served straight from local storage, no
+                // consensus round needed.
+                try {
+                    std::cout << sql.Execute(line) << "\n";
+                } catch (const std::exception& e) {
+                    std::cout << "ERROR: " << e.what() << "\n";
+                }
+            } else {
+                // ProposeOrForward means this REPL doesn't need to be
+                // pointed at the leader itself: if this node isn't it,
+                // the request gets forwarded over the network to
+                // whichever node is (or several, if that guess is
+                // stale) before the result comes back.
+                auto resp = node.ProposeOrForward(line);
+                if (resp.success) {
+                    std::cout << "OK (committed at index " << resp.index << ", via leader node "
+                               << resp.leader_hint << ")\n";
+                } else {
+                    std::cout << "FAILED";
+                    if (resp.not_leader && resp.leader_hint != 0) {
+                        std::cout << " (best known leader is node " << resp.leader_hint << ", but still failed";
+                        if (!resp.error.empty()) std::cout << ": " << resp.error;
+                        std::cout << " - retry)";
+                    } else if (!resp.error.empty()) {
+                        std::cout << " (" << resp.error << ")";
+                    }
+                    std::cout << "\n";
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "fatal: " << e.what() << "\n";
+        return 1;
+    }
+    return 0;
+}

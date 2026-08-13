@@ -1,0 +1,16 @@
+build/
+data/
+*.exe
+*.obj
+*.o
+
+# Local scratch state from manual raftnode testing (raft log, kv data)
+node1/
+node2/
+node3/
+
+# Personal notes, not part of the project source
+DBDistributed.docx
+
+# Claude Code session tooling data
+.claude/
