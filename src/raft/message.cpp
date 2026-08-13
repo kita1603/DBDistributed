@@ -198,4 +198,42 @@ ClientResponse DecodeClientResponse(const std::string& body) {
     return resp;
 }
 
+std::string EncodeInstallSnapshotRequest(const InstallSnapshotRequest& req) {
+    std::string out;
+    AppendU8(out, static_cast<uint8_t>(MessageType::kInstallSnapshotRequest));
+    AppendU64(out, req.term);
+    AppendU32(out, req.leader_id);
+    AppendU64(out, req.last_included_index);
+    AppendU64(out, req.last_included_term);
+    AppendString(out, req.data);
+    return out;
+}
+
+InstallSnapshotRequest DecodeInstallSnapshotRequest(const std::string& body) {
+    Reader r(body);
+    r.ReadU8();
+    InstallSnapshotRequest req;
+    req.term = r.ReadU64();
+    req.leader_id = r.ReadU32();
+    req.last_included_index = r.ReadU64();
+    req.last_included_term = r.ReadU64();
+    req.data = r.ReadString();
+    return req;
+}
+
+std::string EncodeInstallSnapshotResponse(const InstallSnapshotResponse& resp) {
+    std::string out;
+    AppendU8(out, static_cast<uint8_t>(MessageType::kInstallSnapshotResponse));
+    AppendU64(out, resp.term);
+    return out;
+}
+
+InstallSnapshotResponse DecodeInstallSnapshotResponse(const std::string& body) {
+    Reader r(body);
+    r.ReadU8();
+    InstallSnapshotResponse resp;
+    resp.term = r.ReadU64();
+    return resp;
+}
+
 }  // namespace distdb

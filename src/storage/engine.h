@@ -41,6 +41,13 @@ class StorageEngine {
     // applied afterward.
     std::vector<std::pair<std::string, std::string>> Scan(const std::string& prefix) const;
 
+    // Wipes all durable state (WAL, every SSTable) and starts fresh, as
+    // if this were a brand-new empty database. Used when installing a
+    // Raft snapshot, which replaces this node's entire state wholesale
+    // rather than incrementally applying commands - so whatever was here
+    // before must be discarded first, not merged with.
+    void Reset();
+
  private:
     void FlushMemtable();
     void MaybeCompact();

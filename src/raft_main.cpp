@@ -1,11 +1,14 @@
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include "raft/node.h"
 #include "sql/ast.h"
@@ -15,6 +18,52 @@
 #include "storage/engine.h"
 
 namespace {
+
+// A snapshot is just every key/value pair the local StorageEngine
+// currently holds, length-prefixed the same way EncodeRow/DecodeRow
+// encode a SQL row in sql/executor.cpp - reused here because the same
+// problem (arbitrary bytes, need a self-describing binary format)
+// applies to a whole KV dump too.
+std::string EncodeSnapshot(const std::vector<std::pair<std::string, std::string>>& kvs) {
+    std::string out;
+    uint32_t count = static_cast<uint32_t>(kvs.size());
+    out.append(reinterpret_cast<const char*>(&count), sizeof(count));
+    for (const auto& [key, value] : kvs) {
+        uint32_t klen = static_cast<uint32_t>(key.size());
+        out.append(reinterpret_cast<const char*>(&klen), sizeof(klen));
+        out.append(key);
+        uint32_t vlen = static_cast<uint32_t>(value.size());
+        out.append(reinterpret_cast<const char*>(&vlen), sizeof(vlen));
+        out.append(value);
+    }
+    return out;
+}
+
+std::vector<std::pair<std::string, std::string>> DecodeSnapshot(const std::string& blob) {
+    std::vector<std::pair<std::string, std::string>> result;
+    size_t pos = 0;
+    auto ReadU32 = [&](uint32_t& out) {
+        if (pos + sizeof(uint32_t) > blob.size()) throw std::runtime_error("corrupt snapshot");
+        std::memcpy(&out, blob.data() + pos, sizeof(uint32_t));
+        pos += sizeof(uint32_t);
+    };
+
+    uint32_t count = 0;
+    ReadU32(count);
+    result.reserve(count);
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t klen = 0;
+        ReadU32(klen);
+        std::string key = blob.substr(pos, klen);
+        pos += klen;
+        uint32_t vlen = 0;
+        ReadU32(vlen);
+        std::string value = blob.substr(pos, vlen);
+        pos += vlen;
+        result.emplace_back(std::move(key), std::move(value));
+    }
+    return result;
+}
 
 // Parses "2=127.0.0.1:9002,3=127.0.0.1:9003" into a peer map (this
 // node's own id is not included).
@@ -87,6 +136,14 @@ int main(int argc, char** argv) {
         engine.Open();
         distdb::SqlExecutor sql(engine);
 
+        // StorageEngine/SqlExecutor have no locking of their own (Phase
+        // 1 only ever used them from a single thread). Now that they're
+        // reached from several: the REPL's own thread (SELECT), whatever
+        // thread is applying a just-committed entry, and whatever thread
+        // is building or installing a snapshot - all access goes through
+        // this one mutex.
+        std::mutex engine_mutex;
+
         // Every node applies the exact same sequence of committed SQL
         // statements to its own StorageEngine, which is what makes them
         // end up with identical data. A statement that fails here (e.g.
@@ -95,15 +152,44 @@ int main(int argc, char** argv) {
         // statements - so this never causes replicas to diverge. Must
         // not let the exception escape: see the ApplyCallback contract
         // in raft/node.h.
-        distdb::RaftNode node(id, port, peers, state_dir,
-                               [&sql, id](distdb::LogIndex index, const std::string& command) {
-                                   std::cout << "[node " << id << "] applying #" << index << ": " << command << "\n";
-                                   try {
-                                       sql.Execute(command);
-                                   } catch (const std::exception& e) {
-                                       std::cout << "[node " << id << "] apply error: " << e.what() << "\n";
-                                   }
-                               });
+        auto apply_callback = [&sql, &engine_mutex, id](distdb::LogIndex index, const std::string& command) {
+            std::cout << "[node " << id << "] applying #" << index << ": " << command << "\n";
+            std::lock_guard<std::mutex> lock(engine_mutex);
+            try {
+                sql.Execute(command);
+            } catch (const std::exception& e) {
+                std::cout << "[node " << id << "] apply error: " << e.what() << "\n";
+            }
+        };
+
+        // Called when a badly-lagging follower needs this node's (the
+        // leader's) entire current state, because the log entries it
+        // would otherwise need have already been compacted away.
+        auto snapshot_callback = [&engine, &engine_mutex, id]() -> std::string {
+            std::lock_guard<std::mutex> lock(engine_mutex);
+            auto kvs = engine.Scan("");
+            std::cout << "[node " << id << "] building snapshot: " << kvs.size() << " key(s)\n";
+            return EncodeSnapshot(kvs);
+        };
+
+        // Called on the receiving end of the above: replace this node's
+        // entire state with what's in the snapshot, discarding whatever
+        // was here before - a wholesale replacement, not a merge.
+        auto restore_callback = [&engine, &engine_mutex, id](const std::string& data) {
+            std::lock_guard<std::mutex> lock(engine_mutex);
+            auto kvs = DecodeSnapshot(data);
+            std::cout << "[node " << id << "] installing snapshot: " << kvs.size() << " key(s)\n";
+            try {
+                engine.Reset();
+                for (const auto& [key, value] : kvs) {
+                    engine.Put(key, value);
+                }
+            } catch (const std::exception& e) {
+                std::cout << "[node " << id << "] snapshot install FAILED: " << e.what() << "\n";
+            }
+        };
+
+        distdb::RaftNode node(id, port, peers, state_dir, apply_callback, snapshot_callback, restore_callback);
 
         std::cout << "raftnode " << id << " listening on port " << port << ", peers: " << argv[3] << "\n";
         node.Run();
@@ -151,8 +237,11 @@ int main(int argc, char** argv) {
 
             if (std::holds_alternative<distdb::SelectStatement>(parsed)) {
                 // Read-only: served straight from local storage, no
-                // consensus round needed.
+                // consensus round needed. Still needs engine_mutex - a
+                // commit could be getting applied by another thread
+                // concurrently.
                 try {
+                    std::lock_guard<std::mutex> lock(engine_mutex);
                     std::cout << sql.Execute(line) << "\n";
                 } catch (const std::exception& e) {
                     std::cout << "ERROR: " << e.what() << "\n";

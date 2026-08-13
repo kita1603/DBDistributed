@@ -25,6 +25,9 @@ void RaftLog::Load() {
     std::ifstream file(path_, std::ios::binary);
     if (!file.is_open()) return;  // never run before - starts empty
 
+    ReadRaw(file, snapshot_index_);
+    ReadRaw(file, snapshot_term_);
+
     uint32_t count = 0;
     ReadRaw(file, count);
     entries_.reserve(count);
@@ -40,17 +43,18 @@ void RaftLog::Load() {
     }
 }
 
-LogIndex RaftLog::LastIndex() const { return entries_.empty() ? 0 : entries_.back().index; }
-Term RaftLog::LastTerm() const { return entries_.empty() ? 0 : entries_.back().term; }
+LogIndex RaftLog::LastIndex() const { return entries_.empty() ? snapshot_index_ : entries_.back().index; }
+Term RaftLog::LastTerm() const { return entries_.empty() ? snapshot_term_ : entries_.back().term; }
 
 Term RaftLog::TermAt(LogIndex index) const {
-    if (index == 0 || index > entries_.size()) return 0;
-    return entries_[index - 1].term;
+    if (index == snapshot_index_) return snapshot_term_;
+    if (index < snapshot_index_ || index > LastIndex()) return 0;
+    return entries_[index - snapshot_index_ - 1].term;
 }
 
 std::optional<LogEntry> RaftLog::At(LogIndex index) const {
-    if (index == 0 || index > entries_.size()) return std::nullopt;
-    return entries_[index - 1];
+    if (index <= snapshot_index_ || index > LastIndex()) return std::nullopt;
+    return entries_[index - snapshot_index_ - 1];
 }
 
 LogIndex RaftLog::Append(Term term, std::string command) {
@@ -71,11 +75,14 @@ bool RaftLog::AppendEntriesFrom(LogIndex prev_log_index, Term prev_log_term, con
     bool changed = false;
     for (size_t i = 0; i < entries.size(); i++) {
         LogIndex idx = prev_log_index + 1 + i;
-        if (idx <= entries_.size()) {
-            if (entries_[idx - 1].term == entries[i].term) {
+        if (idx <= snapshot_index_) continue;  // already compacted away - definitely already applied
+
+        size_t pos = idx - snapshot_index_ - 1;
+        if (pos < entries_.size()) {
+            if (entries_[pos].term == entries[i].term) {
                 continue;  // already have this exact entry - a retransmission, nothing to do
             }
-            entries_.resize(idx - 1);  // conflict - drop this entry and everything after it
+            entries_.resize(pos);  // conflict - drop this entry and everything after it
         }
         LogEntry e = entries[i];
         e.index = idx;
@@ -87,10 +94,26 @@ bool RaftLog::AppendEntriesFrom(LogIndex prev_log_index, Term prev_log_term, con
     return true;
 }
 
+void RaftLog::CompactTo(LogIndex last_included_index, Term last_included_term) {
+    if (last_included_index <= snapshot_index_) return;  // already compacted at least this far
+
+    if (last_included_index <= LastIndex() && TermAt(last_included_index) == last_included_term) {
+        size_t drop_count = last_included_index - snapshot_index_;
+        entries_.erase(entries_.begin(), entries_.begin() + static_cast<std::ptrdiff_t>(drop_count));
+    } else {
+        entries_.clear();
+    }
+    snapshot_index_ = last_included_index;
+    snapshot_term_ = last_included_term;
+    Save();
+}
+
 void RaftLog::Save() {
     std::string tmp_path = path_ + ".tmp";
     {
         std::ofstream file(tmp_path, std::ios::binary | std::ios::trunc);
+        WriteRaw(file, snapshot_index_);
+        WriteRaw(file, snapshot_term_);
         uint32_t count = static_cast<uint32_t>(entries_.size());
         WriteRaw(file, count);
         for (const auto& e : entries_) {

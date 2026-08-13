@@ -128,6 +128,23 @@ void StorageEngine::FlushMemtable() {
     MaybeCompact();
 }
 
+void StorageEngine::Reset() {
+    memtable_.Clear();
+
+    // Collect paths and destroy the readers (closing their file handles)
+    // before deleting the underlying files - Windows refuses to delete a
+    // file that's still open elsewhere, unlike POSIX.
+    std::vector<std::string> paths;
+    for (const auto& table : sstables_) paths.push_back(table->path());
+    sstables_.clear();
+    for (const auto& path : paths) {
+        std::filesystem::remove(path);
+    }
+
+    next_sstable_seq_ = 1;
+    wal_.Reset();
+}
+
 void StorageEngine::MaybeCompact() {
     if (sstables_.size() < kCompactionTriggerCount) return;
 

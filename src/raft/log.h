@@ -10,24 +10,30 @@
 namespace distdb {
 
 // The replicated log: an ordered, 1-indexed sequence of (term, command)
-// entries. Persisted by rewriting the whole log file on every mutation
-// (write-to-`.tmp`-then-rename, the same crash-safety trick
-// SSTableWriter::Finish() uses) - simple and always crash-safe, at the
-// cost of O(log size) work per append instead of O(1). Fine at this
-// project's scale; a real implementation appends incrementally and only
-// rewrites the file via periodic snapshotting.
+// entries, plus a boundary (snapshot_index_/snapshot_term_) marking how
+// much of the earlier history has been compacted away. Persisted by
+// rewriting the whole log file on every mutation (write-to-`.tmp`-then-
+// rename, the same crash-safety trick SSTableWriter::Finish() uses) -
+// simple and always crash-safe, at the cost of O(log size) work per
+// mutation instead of O(1). Compaction is what keeps that "log size"
+// bounded instead of growing with the cluster's entire history.
 class RaftLog {
  public:
     explicit RaftLog(std::string path);
 
-    // Loads any prior entries from disk; leaves the log empty if the
-    // file doesn't exist (a node that has never run before).
+    // Loads any prior entries (and the snapshot boundary) from disk;
+    // leaves the log empty if the file doesn't exist (a node that has
+    // never run before).
     void Load();
 
-    LogIndex LastIndex() const;
-    Term LastTerm() const;
-    Term TermAt(LogIndex index) const;  // 0 if index is 0 or past the end
-    std::optional<LogEntry> At(LogIndex index) const;
+    // 0/0 if this log has never been compacted.
+    LogIndex snapshot_index() const { return snapshot_index_; }
+    Term snapshot_term() const { return snapshot_term_; }
+
+    LogIndex LastIndex() const;  // snapshot_index() if there are no entries past it
+    Term LastTerm() const;       // snapshot_term() if there are no entries past it
+    Term TermAt(LogIndex index) const;              // 0 if index is before the snapshot or past the end
+    std::optional<LogEntry> At(LogIndex index) const;  // nullopt likewise
 
     // Leader-side: appends one new entry at the end, persists, and
     // returns its index.
@@ -44,11 +50,27 @@ class RaftLog {
     // fails, meaning the leader must retry with an earlier prev_log_index.
     bool AppendEntriesFrom(LogIndex prev_log_index, Term prev_log_term, const std::vector<LogEntry>& entries);
 
+    // Discards every entry up to and including `last_included_index`,
+    // recording that this log's history before that point is now
+    // represented by a snapshot instead (of term `last_included_term`).
+    // If this log still holds that exact (index, term) pair, whatever
+    // comes after it is kept - the common case, whether compacting our
+    // own already-applied history or catching up a follower that's only
+    // slightly behind. Otherwise every existing entry is discarded, since
+    // none of them can be trusted to agree with the snapshot - the case
+    // for a follower that's badly diverged or far behind, installing a
+    // leader's InstallSnapshot. A no-op if `last_included_index` is at or
+    // before the current snapshot boundary (already compacted at least
+    // that far).
+    void CompactTo(LogIndex last_included_index, Term last_included_term);
+
  private:
     void Save();
 
     std::string path_;
-    std::vector<LogEntry> entries_;  // entries_[i] holds log index i+1
+    LogIndex snapshot_index_ = 0;
+    Term snapshot_term_ = 0;
+    std::vector<LogEntry> entries_;  // entries_[i] holds log index snapshot_index_ + 1 + i
 };
 
 }  // namespace distdb

@@ -67,6 +67,25 @@ struct ClientResponse {
     std::string error;
 };
 
+// Sent by a leader to a follower whose nextIndex has fallen at or before
+// the leader's own log.snapshot_index() - meaning the entries that
+// follower needs have already been compacted away, so there's nothing
+// left to replay via AppendEntries. `data` is an opaque (to Raft) dump of
+// the whole state machine as of `last_included_index`/`last_included_term`,
+// produced by the application's SnapshotCallback; the receiver hands it to
+// its own RestoreCallback to adopt it wholesale.
+struct InstallSnapshotRequest {
+    Term term = 0;
+    NodeId leader_id = 0;
+    LogIndex last_included_index = 0;
+    Term last_included_term = 0;
+    std::string data;
+};
+
+struct InstallSnapshotResponse {
+    Term term = 0;
+};
+
 enum class MessageType : uint8_t {
     kRequestVoteRequest = 1,
     kRequestVoteResponse = 2,
@@ -74,6 +93,8 @@ enum class MessageType : uint8_t {
     kAppendEntriesResponse = 4,
     kClientRequest = 5,
     kClientResponse = 6,
+    kInstallSnapshotRequest = 7,
+    kInstallSnapshotResponse = 8,
 };
 
 // Each Encode* function produces a type-tagged binary buffer:
@@ -86,6 +107,8 @@ std::string EncodeAppendEntriesRequest(const AppendEntriesRequest& req);
 std::string EncodeAppendEntriesResponse(const AppendEntriesResponse& resp);
 std::string EncodeClientRequest(const ClientRequest& req);
 std::string EncodeClientResponse(const ClientResponse& resp);
+std::string EncodeInstallSnapshotRequest(const InstallSnapshotRequest& req);
+std::string EncodeInstallSnapshotResponse(const InstallSnapshotResponse& resp);
 
 // Throws std::runtime_error if `body` is too short for its declared
 // fields (a corrupt or truncated message).
@@ -96,5 +119,7 @@ AppendEntriesRequest DecodeAppendEntriesRequest(const std::string& body);
 AppendEntriesResponse DecodeAppendEntriesResponse(const std::string& body);
 ClientRequest DecodeClientRequest(const std::string& body);
 ClientResponse DecodeClientResponse(const std::string& body);
+InstallSnapshotRequest DecodeInstallSnapshotRequest(const std::string& body);
+InstallSnapshotResponse DecodeInstallSnapshotResponse(const std::string& body);
 
 }  // namespace distdb

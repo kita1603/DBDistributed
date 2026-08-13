@@ -41,23 +41,62 @@ enum class Role {
 // might error) must catch internally and just log/ignore the failure.
 using ApplyCallback = std::function<void(LogIndex index, const std::string& command)>;
 
-// A from-scratch Raft node: leader election, heartbeats, and now real
-// log replication. A client calls Propose() on whichever node is
-// currently the leader; the command is appended to that node's log,
-// replicated to followers via AppendEntries (with the standard
+// Called when this node needs to send its current state to a badly-
+// lagging follower (one whose nextIndex has fallen at or before what's
+// been compacted away): must return a self-contained dump of the whole
+// state machine's current contents, opaque to Raft. Same "must not
+// throw" contract as ApplyCallback. Unlike ApplyCallback, this one *is*
+// called with mutex_ held (see SendInstallSnapshot) - deliberately: the
+// index this dump gets labeled with must be exactly what it reflects, and
+// the only way to guarantee that is to make the dump and the "how far has
+// this node applied" bookkeeping atomic with each other, since both
+// ApplyCallback and this run under the same lock. Concretely, this can
+// block other RPCs for as long as the dump takes - acceptable at this
+// project's scale (the whole point is correctness: an understated index
+// would let already-applied entries get re-applied later, and replaying a
+// non-idempotent SQL statement like INSERT on data that's already there
+// fails outright rather than silently doing nothing).
+using SnapshotCallback = std::function<std::string()>;
+
+// The receiving side of SnapshotCallback's output: replace the state
+// machine's entire current content with what's encoded in `data`,
+// discarding whatever was there before. Same "must not throw" contract as
+// ApplyCallback, but - unlike SnapshotCallback - this one runs *without*
+// mutex_ held (see HandleInstallSnapshot), so a slow restore doesn't block
+// this node's ability to handle other RPCs (elections, AppendEntries from
+// the same leader) meanwhile. A dedicated install_mutex_ (not mutex_)
+// still guarantees only one restore runs at a time.
+using RestoreCallback = std::function<void(const std::string& data)>;
+
+// A from-scratch Raft node: leader election, heartbeats, real log
+// replication, and log compaction. A client calls Propose() on whichever
+// node is currently the leader; the command is appended to that node's
+// log, replicated to followers via AppendEntries (with the standard
 // prevLogIndex/prevLogTerm consistency check and conflict-truncation),
 // and handed to ApplyCallback on every node once a majority holds it
-// durably.
+// durably. Once enough entries have been applied, the log entries behind
+// them are discarded via RaftLog::CompactTo() - they're already reflected
+// in the state machine, which persists itself independently, so nothing
+// is lost. A follower whose needed entries have already been compacted
+// away on the leader gets caught up via InstallSnapshot instead of
+// AppendEntries: the leader calls SnapshotCallback for a fresh dump of
+// its current state and ships that wholesale; the follower's
+// RestoreCallback replaces its own state machine with it and adopts the
+// same compaction boundary.
 //
 // Concurrency model: a single mutex_ guards all mutable state (role,
 // term, log, commit index, per-follower replication progress). RPC
 // handlers, the ticker, and Propose() take it for their critical section
-// but release it before any network I/O, so one slow/unreachable peer
-// never blocks the rest of the node.
+// but release it before any network I/O - or before calling
+// SnapshotCallback/RestoreCallback, which can also be slow - so one
+// slow/unreachable peer, or one slow snapshot, never blocks the rest of
+// the node.
 class RaftNode {
  public:
     RaftNode(NodeId id, uint16_t listen_port, std::map<NodeId, PeerAddress> peers, std::string state_dir,
-             ApplyCallback apply_callback = [](LogIndex, const std::string&) {});
+             ApplyCallback apply_callback = [](LogIndex, const std::string&) {},
+             SnapshotCallback snapshot_callback = [] { return std::string(); },
+             RestoreCallback restore_callback = [](const std::string&) {});
 
     // Starts the RPC listener and the background election/heartbeat/
     // replication ticker (each on its own thread) and returns - this
@@ -92,11 +131,13 @@ class RaftNode {
     RequestVoteResponse HandleRequestVote(const RequestVoteRequest& req);
     AppendEntriesResponse HandleAppendEntries(const AppendEntriesRequest& req);
     ClientResponse HandleClientRequest(const ClientRequest& req);
+    InstallSnapshotResponse HandleInstallSnapshot(const InstallSnapshotRequest& req);
 
     void TickerLoop();
     void StartElection();
     void ReplicateToAll();
     void ReplicateTo(NodeId peer_id, const PeerAddress& addr);
+    void SendInstallSnapshot(NodeId peer_id, const PeerAddress& addr, Term term);
 
     // All of the below assume the caller already holds mutex_.
     void ApplyCommitted();
@@ -108,8 +149,20 @@ class RaftNode {
     uint16_t listen_port_;
     std::map<NodeId, PeerAddress> peers_;
     ApplyCallback apply_callback_;
+    SnapshotCallback snapshot_callback_;
+    RestoreCallback restore_callback_;
 
     mutable std::mutex mutex_;
+    // Serializes HandleInstallSnapshot calls against each other (but not
+    // against anything else): the accept loop spawns a thread per
+    // connection, so if a leader's retries overlap - one still in flight
+    // when the next round starts - two InstallSnapshot RPCs could
+    // otherwise run concurrently on this follower and finish out of
+    // order, letting a stale (smaller) snapshot's wholesale restore
+    // clobber a newer one that already landed. This isn't mutex_ itself
+    // because a slow restore_callback_ shouldn't block unrelated RPCs
+    // (elections, AppendEntries) - only a second concurrent install.
+    std::mutex install_mutex_;
     std::condition_variable commit_cv_;
     PersistentState state_;
     RaftLog log_;

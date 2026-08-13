@@ -137,15 +137,66 @@ proposed on the *new* leader also replicates, and the surviving follower's
 final `SELECT` shows both the pre-crash and post-crash rows - a full write →
 replicate → crash → re-elect → keep-writing cycle with no data loss.
 
+#### Log compaction and InstallSnapshot
+
+`RaftLog` tracks a `snapshot_index_`/`snapshot_term_` boundary in addition to
+its entries. Once `last_applied_` passes that boundary by `kCompactionThreshold`
+(5, small on purpose so it's easy to trigger by hand), `ApplyCommitted()` calls
+`log_.CompactTo()`, which discards every entry up to that point - they're
+already durably reflected in the state machine (`StorageEngine` persists
+itself independently via its own WAL/SSTables), so nothing is lost, and the
+`.tmp`-then-rename rewrite this keeps small stays cheap.
+
+A follower whose `nextIndex` has fallen at or before the *leader's*
+`snapshot_index()` can't be caught up via `AppendEntries` any more - those
+entries don't exist there any more either. `ReplicateTo` detects this and
+calls `SendInstallSnapshot` instead: the leader dumps its entire current
+state via `SnapshotCallback` and ships it in one `InstallSnapshotRequest`;
+the follower's `RestoreCallback` wipes its own state (`StorageEngine::Reset()`)
+and reloads it wholesale, then adopts the same compaction boundary via
+`log_.CompactTo()`.
+
+Two correctness details that weren't obvious until testing surfaced them:
+
+- **The declared boundary must exactly match what the dump contains.**
+  `SnapshotCallback` is deliberately called *with `mutex_` held* (unlike
+  `ApplyCallback`, which explicitly isn't), specifically so no commit can land
+  between reading `last_applied_` and taking the dump - `log_.snapshot_index()`
+  looked like the obvious index to use here and is wrong, since compaction only
+  runs every `kCompactionThreshold` entries while the state machine is updated
+  on every single one. Understating the boundary would make the follower
+  later re-receive, and re-apply, entries whose effect the dump already
+  contains - and unlike a raw KV `PUT`, replaying a SQL `INSERT` against data
+  that's already there fails outright (duplicate primary key) rather than
+  harmlessly doing nothing twice.
+- **Two InstallSnapshot RPCs can race on the same follower.** The accept loop
+  spawns a thread per connection, so if a leader's retry overlaps with a
+  still-in-flight earlier attempt, two wholesale restores could run out of
+  order and let a stale (smaller) snapshot clobber a newer one that already
+  landed. A dedicated `install_mutex_` (not `mutex_` - a slow restore
+  shouldn't block unrelated RPCs like elections) serializes
+  `HandleInstallSnapshot` calls against each other so this can't happen.
+
+Verified by hand: kill a follower immediately (before it receives anything),
+write enough entries through the leader to trigger two compactions, revive
+the follower fresh - `SendInstallSnapshot` fires automatically on the next
+replication round, and the revived node's `SELECT` shows every row once
+catch-up settles, with no duplicate-key apply errors.
+
 Known simplifications: RPCs are one-shot connections, not persistent
 per-peer links; peer addresses must be literal IPs (`SendRequest` uses
 `inet_pton`, which doesn't resolve hostnames - no `getaddrinfo` yet); reads
-(`get`/`SELECT`) aren't linearizable; there's no snapshotting, so the log
-grows without bound instead of being compacted once its entries are
-reflected in a snapshot; election/heartbeat timing constants are tuned for
-fast local testing, not production margins; there's no authentication or
-encryption between nodes, fine for a trusted LAN/localhost but not for
-anything reachable by untrusted hosts.
+(`get`/`SELECT`) aren't linearizable; election/heartbeat timing constants are
+tuned for fast local testing, not production margins; there's no
+authentication or encryption between nodes, fine for a trusted LAN/localhost
+but not for anything reachable by untrusted hosts; `SendInstallSnapshot` has
+no backoff, so a leader keeps rebuilding and resending a fresh dump on every
+replication round to an unreachable/still-lagging peer instead of waiting
+between attempts - wasteful but not incorrect at this project's scale;
+calling `SnapshotCallback` with `mutex_` held means a large dump would block
+the whole node's RPC handling for its duration - deliberately traded for
+correctness here (see above), but would need addressing (e.g. a
+copy-on-write/versioned state machine) at real data volumes.
 
 `connect()` *is* bounded by `timeout_ms` (via a non-blocking connect +
 `select()`, in `transport.cpp`) - this matters more than it sounds: on

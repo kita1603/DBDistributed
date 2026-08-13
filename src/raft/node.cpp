@@ -20,6 +20,13 @@ constexpr int kElectionTimeoutMinMs = 400;
 constexpr int kElectionTimeoutMaxMs = 600;
 constexpr int kRpcTimeoutMs = 150;
 constexpr int kMaxForwardHops = 3;
+// A snapshot dump can be much larger than a normal heartbeat/AppendEntries
+// payload, so it gets a longer RPC timeout.
+constexpr int kSnapshotRpcTimeoutMs = 5000;
+// Kept deliberately small (applied entries, not raw command bytes) so
+// compaction is easy to trigger and observe by hand while testing. A
+// real deployment would size this off log *bytes*, not entry count.
+constexpr LogIndex kCompactionThreshold = 5;
 
 int RandomElectionTimeoutMs() {
     static thread_local std::mt19937 rng(std::random_device{}());
@@ -30,11 +37,14 @@ int RandomElectionTimeoutMs() {
 }  // namespace
 
 RaftNode::RaftNode(NodeId id, uint16_t listen_port, std::map<NodeId, PeerAddress> peers, std::string state_dir,
-                    ApplyCallback apply_callback)
+                    ApplyCallback apply_callback, SnapshotCallback snapshot_callback,
+                    RestoreCallback restore_callback)
     : id_(id),
       listen_port_(listen_port),
       peers_(std::move(peers)),
       apply_callback_(std::move(apply_callback)),
+      snapshot_callback_(std::move(snapshot_callback)),
+      restore_callback_(std::move(restore_callback)),
       state_(state_dir + "/raft_state_" + std::to_string(id) + ".txt"),
       log_(state_dir + "/raft_log_" + std::to_string(id) + ".bin"),
       transport_(listen_port) {
@@ -78,6 +88,8 @@ std::string RaftNode::HandleMessage(const std::string& request_body) {
             return EncodeAppendEntriesResponse(HandleAppendEntries(DecodeAppendEntriesRequest(request_body)));
         case MessageType::kClientRequest:
             return EncodeClientResponse(HandleClientRequest(DecodeClientRequest(request_body)));
+        case MessageType::kInstallSnapshotRequest:
+            return EncodeInstallSnapshotResponse(HandleInstallSnapshot(DecodeInstallSnapshotRequest(request_body)));
         default:
             throw std::runtime_error("unexpected message type received");
     }
@@ -114,6 +126,21 @@ void RaftNode::ApplyCommitted() {
         if (entry) apply_callback_(entry->index, entry->command);
     }
     commit_cv_.notify_all();
+
+    // Everything up to last_applied_ is already durably reflected in the
+    // state machine (it persists itself independently - see
+    // SnapshotCallback's doc comment), so the log entries that produced
+    // it can be discarded. This is a pure RaftLog operation (no
+    // SnapshotCallback involved): trimming our own already-applied
+    // history is always safe, unlike restoring a follower from a
+    // leader's snapshot, which is the only case that needs the actual
+    // state-machine dump.
+    if (last_applied_ - log_.snapshot_index() >= kCompactionThreshold) {
+        LogIndex old_snapshot_index = log_.snapshot_index();
+        log_.CompactTo(last_applied_, log_.TermAt(last_applied_));
+        std::cout << "[node " << id_ << "] compacted log: snapshot index " << old_snapshot_index << " -> "
+                  << log_.snapshot_index() << "\n";
+    }
 }
 
 RequestVoteResponse RaftNode::HandleRequestVote(const RequestVoteRequest& req) {
@@ -263,18 +290,32 @@ void RaftNode::ReplicateTo(NodeId peer_id, const PeerAddress& addr) {
     Term prev_log_term;
     std::vector<LogEntry> entries_to_send;
     LogIndex leader_commit;
+    bool needs_snapshot = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (role_ != Role::kLeader) return;
         term = state_.current_term();
         LogIndex next_idx = next_index_[peer_id];
-        prev_log_index = next_idx - 1;
-        prev_log_term = log_.TermAt(prev_log_index);
-        for (LogIndex i = next_idx; i <= log_.LastIndex(); i++) {
-            auto entry = log_.At(i);
-            if (entry) entries_to_send.push_back(*entry);
+        if (next_idx <= log_.snapshot_index()) {
+            // The entries this follower needs have already been
+            // compacted away on our side - there's nothing left to
+            // replay via AppendEntries, so it needs our current state
+            // wholesale instead.
+            needs_snapshot = true;
+        } else {
+            prev_log_index = next_idx - 1;
+            prev_log_term = log_.TermAt(prev_log_index);
+            for (LogIndex i = next_idx; i <= log_.LastIndex(); i++) {
+                auto entry = log_.At(i);
+                if (entry) entries_to_send.push_back(*entry);
+            }
+            leader_commit = commit_index_;
         }
-        leader_commit = commit_index_;
+    }
+
+    if (needs_snapshot) {
+        SendInstallSnapshot(peer_id, addr, term);
+        return;
     }
 
     size_t sent_count = entries_to_send.size();
@@ -334,6 +375,98 @@ void RaftNode::ReplicateTo(NodeId peer_id, const PeerAddress& addr) {
             if (next_idx > 1) next_idx--;
         }
     }).detach();
+}
+
+void RaftNode::SendInstallSnapshot(NodeId peer_id, const PeerAddress& addr, Term term) {
+    LogIndex snapshot_index;
+    Term snapshot_term;
+    std::string data;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (role_ != Role::kLeader || term != state_.current_term()) return;
+
+        // The declared boundary must be exactly what the dump reflects,
+        // not log_.snapshot_index() (which only tracks how far our *log*
+        // has been trimmed, and can lag behind how far the state machine
+        // has actually been applied - ApplyCommitted() updates last_applied_
+        // on every commit, while CompactTo() only runs every
+        // kCompactionThreshold entries). Understating it would make the
+        // follower re-receive - and re-apply - entries whose effect is
+        // already sitting in this dump; SQL statements like INSERT
+        // aren't idempotent (a duplicate primary key fails), so that's
+        // not just wasted work, it's a real error. Calling
+        // snapshot_callback_ here (under mutex_) is what makes this
+        // atomic: ApplyCommitted() also needs mutex_, so no commit can
+        // land between reading last_applied_ and taking the dump.
+        snapshot_index = last_applied_;
+        snapshot_term = log_.TermAt(snapshot_index);
+        data = snapshot_callback_();
+    }
+
+    std::string encoded = EncodeInstallSnapshotRequest({term, id_, snapshot_index, snapshot_term, data});
+
+    std::thread([this, peer_id, addr, encoded, term, snapshot_index] {
+        std::string response;
+        try {
+            response = RaftTransport::SendRequest(addr.host, addr.port, encoded, kSnapshotRpcTimeoutMs);
+        } catch (...) {
+            return;  // peer unreachable right now - retried on a later round
+        }
+        InstallSnapshotResponse resp = DecodeInstallSnapshotResponse(response);
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (resp.term > state_.current_term()) {
+            BecomeFollower(resp.term);
+            return;
+        }
+        if (role_ != Role::kLeader || term != state_.current_term()) return;
+
+        // InstallSnapshot has no consistency check to fail the way
+        // AppendEntries does - the follower just adopts it wholesale -
+        // so any response means it now has everything through
+        // snapshot_index. Resume normal AppendEntries from there.
+        next_index_[peer_id] = snapshot_index + 1;
+        match_index_[peer_id] = snapshot_index;
+    }).detach();
+}
+
+InstallSnapshotResponse RaftNode::HandleInstallSnapshot(const InstallSnapshotRequest& req) {
+    // Held for the whole call (including the restore below) so two
+    // overlapping InstallSnapshot RPCs on this node can never race each
+    // other - see the member's doc comment in node.h.
+    std::lock_guard<std::mutex> install_lock(install_mutex_);
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (req.term < state_.current_term()) {
+            return {state_.current_term()};
+        }
+        if (req.term > state_.current_term() || role_ != Role::kFollower) {
+            BecomeFollower(req.term);
+        }
+        ResetElectionDeadline();
+        leader_hint_ = req.leader_id;
+
+        if (req.last_included_index <= log_.snapshot_index()) {
+            return {state_.current_term()};  // we're already at least this far along - nothing to do
+        }
+    }
+
+    // Restoring replaces the whole state machine wholesale, so it's done
+    // outside mutex_: it can be slow (real I/O over however much data is
+    // in the snapshot) and must not block this node's ability to handle
+    // other RPCs (elections, AppendEntries from this same leader) in the
+    // meantime.
+    restore_callback_(req.data);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (req.last_included_index > log_.snapshot_index()) {
+        log_.CompactTo(req.last_included_index, req.last_included_term);
+        if (req.last_included_index > commit_index_) commit_index_ = req.last_included_index;
+        if (req.last_included_index > last_applied_) last_applied_ = req.last_included_index;
+        commit_cv_.notify_all();
+    }
+    return {state_.current_term()};
 }
 
 bool RaftNode::Propose(const std::string& command, LogIndex* out_index, int timeout_ms) {
