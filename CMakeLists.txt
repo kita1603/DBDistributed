@@ -61,5 +61,11 @@ add_library(distdb_shard
 target_include_directories(distdb_shard PUBLIC src)
 target_link_libraries(distdb_shard PUBLIC distdb_raft)
 
+add_library(distdb_txn
+    src/txn/txn.cpp
+    src/txn/participant.cpp
+)
+target_include_directories(distdb_txn PUBLIC src)
+
 add_executable(raftnode src/raft_main.cpp)
-target_link_libraries(raftnode PRIVATE distdb_raft distdb_storage distdb_sql distdb_shard)
+target_link_libraries(raftnode PRIVATE distdb_raft distdb_storage distdb_sql distdb_shard distdb_txn)

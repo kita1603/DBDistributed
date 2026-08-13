@@ -18,6 +18,8 @@
 #include "sql/lexer.h"
 #include "sql/parser.h"
 #include "storage/engine.h"
+#include "txn/participant.h"
+#include "txn/txn.h"
 
 namespace {
 
@@ -110,7 +112,14 @@ void PrintHelp() {
                  "Anything else (no WHERE <pk> = ...) is scattered to every shard and the\n"
                  "results/counts gathered back into one answer.\n"
                  "\n"
-                 "  status   show role / term / current leader hint / shard id\n"
+                 "  begin              start a transaction: buffers writes instead of running\n"
+                 "                     them, until commit/rollback. Only INSERT/UPDATE/DELETE\n"
+                 "                     whose WHERE pins the primary key are allowed inside one\n"
+                 "                     (no CREATE TABLE, no SELECT, no whole-table scatter).\n"
+                 "  commit             two-phase commit every buffered statement, atomically\n"
+                 "                     across however many shards they touch\n"
+                 "  rollback           discard the buffer - nothing was ever sent anywhere\n"
+                 "  status             show role / term / current leader hint / shard id\n"
                  "  help\n"
                  "  exit\n";
 }
@@ -183,6 +192,92 @@ std::string MergeSelectResults(const std::vector<std::string>& shard_results) {
     return out.str();
 }
 
+// One entry per buffered write statement between BEGIN and COMMIT: which
+// shard its row key belongs to, that key (for the PREPARE's lock), and
+// the raw SQL line (staged, to actually run once the transaction
+// commits).
+struct BufferedTxnStatement {
+    distdb::ShardId shard_id;
+    std::string key;
+    std::string sql;
+};
+
+// Runs two-phase commit across every shard `buffer`'s statements touch:
+// PREPARE each participant (locks its keys, stages its commands -
+// nothing runs yet), and only if every one of them votes yes, tell them
+// all to COMMIT (run the staged commands for real); if any votes no (or
+// isn't reachable), tell whichever ones *did* prepare to ABORT instead
+// (discard, release locks, nothing they hold ever became visible).
+// Returns a human-readable outcome line for the REPL to print.
+std::string RunTransaction(distdb::RoutingTable& routing, distdb::RaftNode& node, distdb::ShardId my_shard_id,
+                            distdb::TxnId txn_id, const std::vector<BufferedTxnStatement>& buffer, int timeout_ms) {
+    std::map<distdb::ShardId, distdb::TxnPrepare> by_shard;
+    for (const auto& stmt : buffer) {
+        auto& prepare = by_shard[stmt.shard_id];
+        prepare.txn_id = txn_id;
+        prepare.keys.push_back(stmt.key);
+        prepare.commands.push_back(stmt.sql);
+    }
+
+    auto send_to_shard = [&](distdb::ShardId sid, const std::string& command) {
+        if (sid == my_shard_id) return node.ProposeOrForward(command, timeout_ms);
+        return distdb::SendClientRequest(routing.Shard(sid).peers, command, timeout_ms);
+    };
+
+    std::vector<distdb::ShardId> prepared_shards;
+    std::string abort_reason;
+    for (const auto& [sid, prepare] : by_shard) {
+        distdb::ClientResponse resp;
+        try {
+            resp = send_to_shard(sid, distdb::EncodeTxnPrepare(prepare));
+        } catch (const std::exception& e) {
+            abort_reason = "shard " + std::to_string(sid) + ": " + e.what();
+            break;
+        }
+        if (!resp.success) {
+            abort_reason = "shard " + std::to_string(sid) + ": " + resp.error;
+            break;
+        }
+        prepared_shards.push_back(sid);
+    }
+
+    if (!abort_reason.empty()) {
+        std::vector<std::string> abort_failures;
+        for (auto sid : prepared_shards) {
+            try {
+                auto resp = send_to_shard(sid, distdb::EncodeTxnAbort(txn_id));
+                if (!resp.success) abort_failures.push_back("shard " + std::to_string(sid) + ": " + resp.error);
+            } catch (const std::exception& e) {
+                abort_failures.push_back("shard " + std::to_string(sid) + ": " + e.what());
+            }
+        }
+        std::string msg = "ABORTED (" + abort_reason + ")";
+        for (const auto& f : abort_failures) msg += " [rollback also failed on " + f + "]";
+        return msg;
+    }
+
+    std::vector<std::string> commit_failures;
+    for (const auto& [sid, prepare] : by_shard) {
+        (void)prepare;
+        try {
+            auto resp = send_to_shard(sid, distdb::EncodeTxnCommit(txn_id));
+            if (!resp.success) commit_failures.push_back("shard " + std::to_string(sid) + ": " + resp.error);
+        } catch (const std::exception& e) {
+            commit_failures.push_back("shard " + std::to_string(sid) + ": " + e.what());
+        }
+    }
+
+    if (commit_failures.empty()) {
+        return "OK (committed transaction " + std::to_string(txn_id) + " across " +
+               std::to_string(by_shard.size()) + " shard(s))";
+    }
+    std::string msg = "transaction " + std::to_string(txn_id) +
+                       " was DECIDED TO COMMIT but couldn't notify every shard:";
+    for (const auto& f : commit_failures) msg += " [" + f + "]";
+    msg += " - those shard(s) may still be holding locks; retrying the same COMMIT is safe once they're reachable";
+    return msg;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -225,10 +320,46 @@ int main(int argc, char** argv) {
         // remote shard's SendReadRequest.
         std::mutex engine_mutex;
 
-        auto apply_callback = [&sql, &engine_mutex, node_id](distdb::LogIndex index,
-                                                              const std::string& command) -> std::string {
-            std::cout << "[node " << node_id << "] applying #" << index << ": " << command << "\n";
+        // This shard's row-key locks and staged commands for every
+        // transaction currently prepared here - see txn/participant.h.
+        // Guarded by engine_mutex too: every call into it happens from
+        // inside apply_callback, which already holds it for the SQL side
+        // of the same apply.
+        distdb::TxnParticipant txn_participant;
+
+        auto apply_callback = [&sql, &engine_mutex, &txn_participant, node_id](
+                                   distdb::LogIndex index, const std::string& command) -> std::string {
             std::lock_guard<std::mutex> lock(engine_mutex);
+
+            if (auto control = distdb::TryDecodeTxnControl(command)) {
+                switch (control->type) {
+                    case distdb::TxnControlType::kPrepare: {
+                        std::cout << "[node " << node_id << "] applying #" << index << ": PREPARE txn "
+                                  << control->txn_id << " (" << control->keys.size() << " key(s))\n";
+                        std::string error = txn_participant.Prepare(control->txn_id, control->keys, control->commands);
+                        if (!error.empty()) std::cout << "[node " << node_id << "] prepare vote NO: " << error << "\n";
+                        return error;
+                    }
+                    case distdb::TxnControlType::kCommit: {
+                        std::cout << "[node " << node_id << "] applying #" << index << ": COMMIT txn "
+                                  << control->txn_id << "\n";
+                        try {
+                            return txn_participant.Commit(control->txn_id,
+                                                           [&](const std::string& staged) { sql.Execute(staged); });
+                        } catch (const std::exception& e) {
+                            std::cout << "[node " << node_id << "] apply error inside committed txn "
+                                      << control->txn_id << ": " << e.what() << "\n";
+                            return std::string(e.what());
+                        }
+                    }
+                    case distdb::TxnControlType::kAbort:
+                        std::cout << "[node " << node_id << "] applying #" << index << ": ABORT txn "
+                                  << control->txn_id << "\n";
+                        return txn_participant.Abort(control->txn_id);
+                }
+            }
+
+            std::cout << "[node " << node_id << "] applying #" << index << ": " << command << "\n";
             try {
                 sql.Execute(command);
                 return "";
@@ -271,6 +402,15 @@ int main(int argc, char** argv) {
         node.Run();
         PrintHelp();
 
+        // Transaction-buffering state: while `in_txn`, writes are queued
+        // here instead of running immediately - see the "begin" handling
+        // below. txn_counter combines with this node's own id to make
+        // every txn_id it ever generates globally unique without needing
+        // a dedicated sequencer (see RunTransaction's caller).
+        bool in_txn = false;
+        std::vector<BufferedTxnStatement> txn_buffer;
+        uint32_t txn_counter = 0;
+
         std::string line;
         while (std::getline(std::cin, line)) {
             // Some redirected-stdin setups (e.g. a .NET StreamWriter
@@ -297,6 +437,38 @@ int main(int argc, char** argv) {
                 std::cout << "shard=" << shard_id << " role=" << RoleName(node.role())
                           << " term=" << node.current_term() << " leader_hint=" << node.leader_hint() << "\n";
                 continue;
+            } else if (first_word == "begin") {
+                if (in_txn) {
+                    std::cout << "ERROR: already in a transaction - commit or rollback it first\n";
+                } else {
+                    in_txn = true;
+                    txn_buffer.clear();
+                    std::cout << "OK (transaction started)\n";
+                }
+                continue;
+            } else if (first_word == "rollback") {
+                if (!in_txn) {
+                    std::cout << "ERROR: not in a transaction\n";
+                } else {
+                    in_txn = false;
+                    txn_buffer.clear();
+                    std::cout << "OK (rolled back - nothing was ever sent)\n";
+                }
+                continue;
+            } else if (first_word == "commit") {
+                if (!in_txn) {
+                    std::cout << "ERROR: not in a transaction\n";
+                } else if (txn_buffer.empty()) {
+                    in_txn = false;
+                    std::cout << "OK (empty transaction, nothing to commit)\n";
+                } else {
+                    in_txn = false;
+                    auto txn_id = (static_cast<distdb::TxnId>(node_id) << 32) | (++txn_counter);
+                    std::cout << RunTransaction(routing, node, shard_id, txn_id, txn_buffer, kCrossShardTimeoutMs)
+                              << "\n";
+                    txn_buffer.clear();
+                }
+                continue;
             }
 
             distdb::Statement parsed;
@@ -305,6 +477,40 @@ int main(int argc, char** argv) {
                 parsed = parser.ParseStatement();
             } catch (const std::exception& e) {
                 std::cout << "ERROR: " << e.what() << "\n";
+                continue;
+            }
+
+            if (in_txn) {
+                // Deliberately narrow: only a statement that pins one
+                // row's primary key can be staged as one participant
+                // shard's share of a PREPARE. CREATE TABLE is schema, not
+                // a row, and a whole-table SELECT/UPDATE/DELETE has no
+                // single shard to lock it against - see the scatter/gather
+                // path above for those, which already has no cross-shard
+                // atomicity story of its own to begin with.
+                if (std::holds_alternative<distdb::CreateTableStatement>(parsed)) {
+                    std::cout << "ERROR: CREATE TABLE is not supported inside a transaction\n";
+                    continue;
+                }
+                if (std::holds_alternative<distdb::SelectStatement>(parsed)) {
+                    std::cout << "ERROR: SELECT is not supported inside a transaction (writes are staged, not "
+                                 "applied, until commit - a read here could never see them anyway); run it before "
+                                 "begin or after commit/rollback\n";
+                    continue;
+                }
+                auto key = sql.TryExtractRowKey(parsed);
+                if (!key) {
+                    std::cout << "ERROR: this statement's WHERE doesn't pin the primary key, so it has no single "
+                                 "shard to lock - not supported inside a transaction\n";
+                    continue;
+                }
+                try {
+                    distdb::ShardId sid = routing.ShardFor(*key).id;
+                    txn_buffer.push_back({sid, *key, line});
+                    std::cout << "OK (queued on shard " << sid << ")\n";
+                } catch (const std::exception& e) {
+                    std::cout << "ERROR: " << e.what() << "\n";
+                }
                 continue;
             }
 

@@ -144,7 +144,13 @@ void RaftNode::ApplyCommitted() {
     if (last_applied_ - log_.snapshot_index() >= kCompactionThreshold) {
         LogIndex old_snapshot_index = log_.snapshot_index();
         log_.CompactTo(last_applied_, log_.TermAt(last_applied_));
-        apply_errors_.erase(apply_errors_.begin(), apply_errors_.upper_bound(log_.snapshot_index()));
+        // Prune up to the *previous* boundary, not the new one: the
+        // entries between them (including whatever was just applied
+        // above, in this very call) may still be waiting on a Propose()
+        // that hasn't checked apply_errors_ yet - erasing up to the new
+        // boundary would delete a just-recorded error before its own
+        // Propose() call ever got to read it.
+        apply_errors_.erase(apply_errors_.begin(), apply_errors_.upper_bound(old_snapshot_index));
         std::cout << "[node " << id_ << "] compacted log: snapshot index " << old_snapshot_index << " -> "
                   << log_.snapshot_index() << "\n";
     }

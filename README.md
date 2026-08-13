@@ -208,8 +208,6 @@ timeout - commonly tens of seconds - which from the caller's side just looks
 like the whole command froze. Multi-machine testing is exactly where this
 would otherwise bite.
 
-Not yet implemented (later phases): distributed transactions.
-
 Known simplifications (fine for learning, called out for later): `MaybeCompact`
 merges every current SSTable at once rather than a leveled/tiered policy over
 a subset; `SSTableReader::ReadAll`/`Scan` materialize results in memory
@@ -315,6 +313,91 @@ one indivisible unit spanning several of them (e.g. moving a value between
 two rows that happen to live on different shards) - that needs real
 distributed transactions (2PC/Percolator-style), which is Phase 4, not
 this one.
+
+## Phase 4: distributed transactions (`src/txn/`)
+
+Phase 3's own gap: a statement that resolves to one shard is atomic, but
+nothing makes several statements spanning *different* shards succeed or fail
+together as one unit. Phase 4 closes that with classic two-phase commit
+(2PC), chosen over a Percolator-style design specifically because it needs
+no changes to the storage engine: Percolator relies on multi-version keys
+(a timestamp oracle, keeping every version of a row) so a transaction can
+read a consistent snapshot and roll back by just discarding a version - this
+project's engine only ever holds one value per key, so building that would
+mean revisiting Phase 1. 2PC instead gets atomicity through **locking plus
+deferred execution**, layered entirely on top of the existing Raft
+groups/sharding with no changes to either:
+
+- `txn.h/.cpp` — encodes/decodes the three control commands
+  (`TxnPrepare`/`Commit`/`Abort`) that drive the protocol. These are proposed
+  through the exact same `Propose()`/`ClientRequest` path as a plain SQL
+  statement - a Raft log entry's `command` is opaque bytes either way - just
+  tagged with a leading `0x00` byte no real SQL statement can ever start
+  with, so `apply_callback` can tell the two apart unambiguously.
+- `participant.h/.cpp` — `TxnParticipant`: one shard's side of the protocol.
+  `Prepare(txn_id, keys, commands)` locks every key (rejecting it - a "no"
+  vote - the instant any key is already locked by a *different* pending
+  transaction) and *stages* the commands without running them yet. Nothing
+  observable happens until `Commit()` actually runs the staged commands and
+  releases the locks, or `Abort()` just releases them and discards the
+  commands unrun. Deferring execution this way is what makes abort free: an
+  aborted transaction never became visible to anything, so there's nothing
+  to undo.
+- `raft_main.cpp`'s REPL gets `begin`/`commit`/`rollback`. Between `begin`
+  and `commit`, each `INSERT`/`UPDATE`/`DELETE` is only *checked* - it must
+  pin its primary key via `TryExtractRowKey` (same rule Phase 3 already
+  needs, since every statement needs a single shard to lock it against; a
+  whole-table scatter has no single shard to prepare, so it's rejected
+  inside a transaction) - and queued client-side, not sent anywhere.
+  `commit` groups the queued statements by shard and runs 2PC: PREPARE every
+  participant shard (`ProposeOrForward` for this node's own shard,
+  `SendClientRequest` for the rest - the identical local/remote split
+  Phase 3's `BroadcastWrite` already uses); if every one votes yes, COMMIT
+  them all; if any votes no (including one being unreachable), ABORT
+  whichever ones *did* successfully prepare. `rollback` never touches the
+  network at all - the buffer was purely local, so there's nothing to undo
+  anywhere.
+- The apply-time error channel added alongside this phase (see `Propose`'s
+  `out_apply_error` in `node.h`) is what makes PREPARE's vote *and* COMMIT's
+  own outcome visible to the coordinator: a lock conflict during PREPARE
+  returns an error from `TxnParticipant::Prepare`, and a staged command that
+  still fails when it actually runs during COMMIT (e.g. a duplicate key
+  that only collides with data the transaction's own lock never covered)
+  returns an error from `TxnParticipant::Commit` - both surface as
+  `ClientResponse::success = false` through the exact same path a plain
+  failed `INSERT` already uses, not a separate mechanism.
+
+Verified by hand on the same 2-shard layout as Phase 3 (table split at
+primary key `"m"`): a transaction inserting one row on each shard reports
+`OK (committed transaction ...)` and a follow-up `SELECT` shows both rows -
+genuinely atomic, not two independent writes that happened to both succeed.
+`rollback` after queuing writes on both shards leaves the table completely
+unchanged, and no PREPARE ever shows up in either node's log - confirming
+the buffer really is client-side only. Re-running the same insert (a
+commit-time duplicate key, since PREPARE's lock check doesn't know about
+data that existed before the transaction) now correctly reports the failure
+instead of a false `OK`, closing the same class of bug the apply-error-
+surfacing fix addressed for plain statements.
+
+Known simplifications: everything `TxnParticipant` holds (locks, staged
+commands) is in-memory only and *not* part of `SnapshotCallback`'s dump - a
+node that restarts, or whose log gets compacted, while a transaction is
+prepared-but-unresolved loses track of that lock entirely (a real system
+would need the lock/pending state to survive snapshots and be recoverable
+from the log, the same way the state machine itself is); a coordinator that
+crashes between deciding to commit and notifying every participant leaves
+those shards holding locks indefinitely - the classic blocking weakness of
+2PC itself (3PC, or a Raft-replicated coordinator, are the usual fixes,
+neither implemented here); a transaction's own reads never see its own
+staged writes (writes are deferred until commit, so `SELECT` is simply
+disallowed inside a transaction rather than given misleading semantics);
+lock conflicts are fail-fast with no retry/backoff/deadlock-detection - two
+transactions racing for the same key, whichever loses is aborted outright,
+never queued to try again; and a shard's staged commands run in sequence
+with no per-command rollback if one throws partway through commit - the
+whole *transaction* either fully prepares or doesn't, but a shard whose own
+batch has more than one statement has no atomicity guarantee purely between
+those statements beyond what the log entry commit already gives it.
 
 ## Build
 

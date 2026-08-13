@@ -9,6 +9,7 @@ node1/
 node2/
 node3/
 single_test/
+txn_test/
 
 # Personal notes, not part of the project source
 DBDistributed.docx
