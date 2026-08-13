@@ -14,3 +14,7 @@ DBDistributed.docx
 
 # Claude Code session tooling data
 .claude/
+
+# Local shard routing config - IPs/ports/shard layout are environment-
+# specific, meant to be hand-edited per deployment rather than tracked
+config/routing.conf
