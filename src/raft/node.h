@@ -33,8 +33,14 @@ enum class Role {
 // often from a detached RPC-response thread - an exception escaping a
 // detached thread's top-level function calls std::terminate() and kills
 // the whole process. A callback that can fail (e.g. executing SQL that
-// might error) must catch internally and just log/ignore the failure.
-using ApplyCallback = std::function<void(LogIndex index, const std::string& command)>;
+// might error) must catch internally and report the failure through the
+// return value instead: empty string means the command applied
+// successfully, non-empty is an error message. This is what lets
+// Propose() tell a duplicate-key (or other apply-time) failure apart
+// from a genuinely successful write - both commit identically, since
+// commit only means "a majority durably logged this command", not
+// "running it succeeded".
+using ApplyCallback = std::function<std::string(LogIndex index, const std::string& command)>;
 
 // Called when this node needs to send its current state to a badly-
 // lagging follower (one whose nextIndex has fallen at or before what's
@@ -97,7 +103,7 @@ using ReadCallback = std::function<std::string(const std::string& query)>;
 class RaftNode {
  public:
     RaftNode(NodeId id, uint16_t listen_port, std::map<NodeId, PeerAddress> peers, std::string state_dir,
-             ApplyCallback apply_callback = [](LogIndex, const std::string&) {},
+             ApplyCallback apply_callback = [](LogIndex, const std::string&) { return std::string(); },
              SnapshotCallback snapshot_callback = [] { return std::string(); },
              RestoreCallback restore_callback = [](const std::string&) {},
              ReadCallback read_callback = [](const std::string&) { return std::string(); });
@@ -119,7 +125,18 @@ class RaftNode {
     // unconfirmed at that point, same as a real Raft client would see
     // it; the caller should retry, possibly against a different node
     // that has since become leader).
-    bool Propose(const std::string& command, LogIndex* out_index, int timeout_ms = 2000);
+    //
+    // Commit and apply are different guarantees: a command can commit
+    // (a majority durably logged it) and still fail when it actually
+    // runs (e.g. a duplicate primary key) - the log doesn't know or
+    // care what the command means. When that happens, Propose() still
+    // returns true (the write IS durably committed - every replica
+    // agrees on having tried it, which is what makes it safe to also
+    // fail identically everywhere), but sets *out_apply_error to the
+    // failure message so the caller can tell "committed and applied"
+    // apart from "committed but rejected at apply time".
+    bool Propose(const std::string& command, LogIndex* out_index, int timeout_ms = 2000,
+                 std::string* out_apply_error = nullptr);
 
     // Like Propose(), but works no matter which node it's called on: if
     // this node isn't the leader, it forwards the request over the
@@ -145,6 +162,7 @@ class RaftNode {
     void SendInstallSnapshot(NodeId peer_id, const PeerAddress& addr, Term term);
 
     // All of the below assume the caller already holds mutex_.
+    void MaybeAdvanceCommitIndex();
     void ApplyCommitted();
     void BecomeFollower(Term term);
     void BecomeLeader();
@@ -176,6 +194,13 @@ class RaftNode {
     NodeId leader_hint_ = 0;
     LogIndex commit_index_ = 0;
     LogIndex last_applied_ = 0;
+
+    // Non-empty entries are indices whose apply_callback_ call returned
+    // an error (e.g. duplicate key) - looked up by Propose() right after
+    // commit_cv_ wakes, so it can tell a client "committed but rejected
+    // at apply time" apart from a clean success. Pruned alongside log
+    // compaction so this can't grow without bound on a long-running node.
+    std::map<LogIndex, std::string> apply_errors_;
 
     std::chrono::steady_clock::time_point election_deadline_;
     std::chrono::steady_clock::time_point next_heartbeat_time_;

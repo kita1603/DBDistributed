@@ -225,13 +225,16 @@ int main(int argc, char** argv) {
         // remote shard's SendReadRequest.
         std::mutex engine_mutex;
 
-        auto apply_callback = [&sql, &engine_mutex, node_id](distdb::LogIndex index, const std::string& command) {
+        auto apply_callback = [&sql, &engine_mutex, node_id](distdb::LogIndex index,
+                                                              const std::string& command) -> std::string {
             std::cout << "[node " << node_id << "] applying #" << index << ": " << command << "\n";
             std::lock_guard<std::mutex> lock(engine_mutex);
             try {
                 sql.Execute(command);
+                return "";
             } catch (const std::exception& e) {
                 std::cout << "[node " << node_id << "] apply error: " << e.what() << "\n";
+                return e.what();
             }
         };
 

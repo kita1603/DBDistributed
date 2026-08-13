@@ -126,7 +126,10 @@ void RaftNode::ApplyCommitted() {
     while (last_applied_ < commit_index_) {
         last_applied_++;
         auto entry = log_.At(last_applied_);
-        if (entry) apply_callback_(entry->index, entry->command);
+        if (entry) {
+            std::string error = apply_callback_(entry->index, entry->command);
+            if (!error.empty()) apply_errors_[entry->index] = std::move(error);
+        }
     }
     commit_cv_.notify_all();
 
@@ -141,6 +144,7 @@ void RaftNode::ApplyCommitted() {
     if (last_applied_ - log_.snapshot_index() >= kCompactionThreshold) {
         LogIndex old_snapshot_index = log_.snapshot_index();
         log_.CompactTo(last_applied_, log_.TermAt(last_applied_));
+        apply_errors_.erase(apply_errors_.begin(), apply_errors_.upper_bound(log_.snapshot_index()));
         std::cout << "[node " << id_ << "] compacted log: snapshot index " << old_snapshot_index << " -> "
                   << log_.snapshot_index() << "\n";
     }
@@ -242,6 +246,18 @@ void RaftNode::StartElection() {
         last_term = log_.LastTerm();
         ResetElectionDeadline();
         std::cout << "[node " << id_ << "] term " << election_term << ": starting election\n";
+
+        // A degenerate but valid case: a single-node cluster (peers_
+        // empty) already has a majority from its own vote alone. The
+        // usual path to BecomeLeader() only runs as a side effect of
+        // processing a peer's RequestVote response below - with no
+        // peers, that loop body never executes, so without this check
+        // a lone node would re-run elections forever without ever
+        // noticing it already won.
+        if (votes_received_ * 2 > static_cast<int>(peers_.size() + 1)) {
+            BecomeLeader();
+            return;
+        }
     }
 
     std::string encoded = EncodeRequestVoteRequest({election_term, id_, last_index, last_term});
@@ -284,6 +300,32 @@ void RaftNode::ReplicateToAll() {
     }
     for (const auto& [peer_id, addr] : peers_copy) {
         ReplicateTo(peer_id, addr);
+    }
+}
+
+// Advance commit_index_ to the highest index a majority (including this
+// node itself) has acknowledged - but only count it if that entry is
+// from our own current term. Committing an older-term entry directly
+// (rather than it committing as a side effect of a later same-term
+// entry committing) is exactly the unsafe case Raft's Figure 8 warns
+// about. Caller must hold mutex_. With zero peers (a single-node
+// cluster), match_indices ends up holding just the leader's own
+// log_.LastIndex() - the leader alone is already a majority of one,
+// so this still correctly advances commit_index_ without waiting on
+// any peer response.
+void RaftNode::MaybeAdvanceCommitIndex() {
+    std::vector<LogIndex> match_indices;
+    match_indices.push_back(log_.LastIndex());  // the leader always has everything it's logged
+    for (const auto& [pid, matched] : match_index_) {
+        (void)pid;
+        match_indices.push_back(matched);
+    }
+    std::sort(match_indices.begin(), match_indices.end(), std::greater<LogIndex>());
+    LogIndex majority_index = match_indices[match_indices.size() / 2];
+
+    if (majority_index > commit_index_ && log_.TermAt(majority_index) == state_.current_term()) {
+        commit_index_ = majority_index;
+        ApplyCommitted();
     }
 }
 
@@ -348,25 +390,7 @@ void RaftNode::ReplicateTo(NodeId peer_id, const PeerAddress& addr) {
             if (new_match > match_index_[peer_id]) match_index_[peer_id] = new_match;
             next_index_[peer_id] = match_index_[peer_id] + 1;
 
-            // Advance commit_index_ to the highest index a majority has
-            // acknowledged - but only count it if that entry is from
-            // our own current term. Committing an older-term entry
-            // directly (rather than it committing as a side effect of a
-            // later same-term entry committing) is exactly the unsafe
-            // case Raft's Figure 8 warns about.
-            std::vector<LogIndex> match_indices;
-            match_indices.push_back(log_.LastIndex());  // the leader always has everything it's logged
-            for (const auto& [pid, matched] : match_index_) {
-                (void)pid;
-                match_indices.push_back(matched);
-            }
-            std::sort(match_indices.begin(), match_indices.end(), std::greater<LogIndex>());
-            LogIndex majority_index = match_indices[match_indices.size() / 2];
-
-            if (majority_index > commit_index_ && log_.TermAt(majority_index) == state_.current_term()) {
-                commit_index_ = majority_index;
-                ApplyCommitted();
-            }
+            MaybeAdvanceCommitIndex();
         } else {
             // The follower's consistency check failed - back off by one
             // and retry on the next replication round. A real
@@ -484,12 +508,13 @@ ReadResponse RaftNode::HandleReadRequest(const ReadRequest& req) {
     }
 }
 
-bool RaftNode::Propose(const std::string& command, LogIndex* out_index, int timeout_ms) {
+bool RaftNode::Propose(const std::string& command, LogIndex* out_index, int timeout_ms, std::string* out_apply_error) {
     LogIndex index;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (role_ != Role::kLeader) return false;
         index = log_.Append(state_.current_term(), command);
+        MaybeAdvanceCommitIndex();  // handles the single-node-cluster case immediately
     }
     if (out_index) *out_index = index;
 
@@ -498,7 +523,12 @@ bool RaftNode::Propose(const std::string& command, LogIndex* out_index, int time
     std::unique_lock<std::mutex> lock(mutex_);
     commit_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
                          [this, index] { return commit_index_ >= index || role_ != Role::kLeader; });
-    return commit_index_ >= index;
+    bool committed = commit_index_ >= index;
+    if (committed && out_apply_error) {
+        auto it = apply_errors_.find(index);
+        if (it != apply_errors_.end()) *out_apply_error = it->second;
+    }
+    return committed;
 }
 
 ClientResponse RaftNode::HandleClientRequest(const ClientRequest& req) {
@@ -506,13 +536,22 @@ ClientResponse RaftNode::HandleClientRequest(const ClientRequest& req) {
         return {false, 0, true, leader_hint(), "not the leader"};
     }
     LogIndex index = 0;
-    bool ok = Propose(req.command, &index);
+    std::string apply_error;
+    bool ok = Propose(req.command, &index, 2000, &apply_error);
     if (!ok) {
         // Either the commit wasn't confirmed within the timeout, or
         // this node stopped being leader partway through - either way,
         // from the caller's perspective the outcome is unconfirmed, not
         // a definite failure.
         return {false, 0, role() != Role::kLeader, leader_hint(), "propose failed or timed out"};
+    }
+    if (!apply_error.empty()) {
+        // Committed - every replica durably logged this command and
+        // will run it identically - but running it failed (e.g.
+        // duplicate primary key). That's a definite, not a timeout-y,
+        // failure: unlike the branch above, retrying this exact command
+        // would just fail the same way again everywhere.
+        return {false, index, false, id_, apply_error};
     }
     return {true, index, false, id_, ""};
 }
