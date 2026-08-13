@@ -3,6 +3,7 @@ data/
 *.exe
 *.obj
 *.o
+.vs/
 
 # Local scratch state from manual raftnode testing (raft log, kv data)
 node1/

@@ -359,11 +359,16 @@ groups/sharding with no changes to either:
   anywhere.
 - The apply-time error channel added alongside this phase (see `Propose`'s
   `out_apply_error` in `node.h`) is what makes PREPARE's vote *and* COMMIT's
-  own outcome visible to the coordinator: a lock conflict during PREPARE
-  returns an error from `TxnParticipant::Prepare`, and a staged command that
-  still fails when it actually runs during COMMIT (e.g. a duplicate key
-  that only collides with data the transaction's own lock never covered)
-  returns an error from `TxnParticipant::Commit` - both surface as
+  own outcome visible to the coordinator: a lock conflict, or a staged
+  `INSERT` whose key already has a row (`FindStagedDuplicateKey`, checked
+  for every command *before* anything in the batch runs - the one
+  precondition failure this project's simple schema can actually have ahead
+  of time, since `UPDATE`/`DELETE` are just no-ops on a missing row rather
+  than errors), makes `TxnParticipant::Prepare` return an error and the
+  whole PREPARE - hence the whole transaction - votes no atomically. A
+  staged command can still fail for some *other* reason once COMMIT
+  actually runs it (a parse error, say); that returns an error from
+  `TxnParticipant::Commit` instead. Either way it surfaces as
   `ClientResponse::success = false` through the exact same path a plain
   failed `INSERT` already uses, not a separate mechanism.
 
@@ -373,11 +378,12 @@ primary key `"m"`): a transaction inserting one row on each shard reports
 genuinely atomic, not two independent writes that happened to both succeed.
 `rollback` after queuing writes on both shards leaves the table completely
 unchanged, and no PREPARE ever shows up in either node's log - confirming
-the buffer really is client-side only. Re-running the same insert (a
-commit-time duplicate key, since PREPARE's lock check doesn't know about
-data that existed before the transaction) now correctly reports the failure
-instead of a false `OK`, closing the same class of bug the apply-error-
-surfacing fix addressed for plain statements.
+the buffer really is client-side only. A batch with two statements on the
+*same* shard, one for a fresh key and one for a key that already exists,
+votes no at PREPARE and aborts the whole transaction - the fresh key's
+`INSERT` never runs at all, rather than the two statements running one at a
+time at COMMIT and leaving the first one's effect stuck with no way to
+undo it once the second one fails.
 
 Known simplifications: everything `TxnParticipant` holds (locks, staged
 commands) is in-memory only and *not* part of `SnapshotCallback`'s dump - a
@@ -393,11 +399,12 @@ staged writes (writes are deferred until commit, so `SELECT` is simply
 disallowed inside a transaction rather than given misleading semantics);
 lock conflicts are fail-fast with no retry/backoff/deadlock-detection - two
 transactions racing for the same key, whichever loses is aborted outright,
-never queued to try again; and a shard's staged commands run in sequence
-with no per-command rollback if one throws partway through commit - the
-whole *transaction* either fully prepares or doesn't, but a shard whose own
-batch has more than one statement has no atomicity guarantee purely between
-those statements beyond what the log entry commit already gives it.
+never queued to try again; and `FindStagedDuplicateKey` only catches the one
+precondition failure this project's schema model can have - a storage
+engine with real constraints (foreign keys, uniqueness beyond the primary
+key, etc.) would need PREPARE to validate against all of them the same way,
+or a shard's batch could still see a command fail partway through COMMIT
+with nothing before it undone.
 
 ## Build
 

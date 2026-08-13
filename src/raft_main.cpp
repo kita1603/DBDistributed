@@ -192,6 +192,36 @@ std::string MergeSelectResults(const std::vector<std::string>& shard_results) {
     return out.str();
 }
 
+// PREPARE only locks keys - it doesn't otherwise know whether a staged
+// command will actually succeed once COMMIT runs it. The one failure
+// mode that's actually foreseeable ahead of time, given this project's
+// simple schema (no other constraints), is an INSERT whose key already
+// has a row: unlike UPDATE/DELETE (a no-op, not an error, if the row
+// doesn't exist), that's a hard error every time. Catching it here,
+// before any command in the batch has run, is what makes a PREPARE
+// atomic with respect to its own multi-statement batch - a "no" vote
+// here means literally nothing in the batch has run, rather than
+// commands 1..k succeeding before command k+1 fails at COMMIT with no
+// way to undo 1..k.
+std::string FindStagedDuplicateKey(distdb::SqlExecutor& sql, distdb::StorageEngine& engine,
+                                    const std::vector<std::string>& commands) {
+    for (const auto& cmd : commands) {
+        distdb::Statement stmt;
+        try {
+            distdb::Parser parser(distdb::Tokenize(cmd));
+            stmt = parser.ParseStatement();
+        } catch (const std::exception&) {
+            continue;  // COMMIT will hit (and correctly report) this same parse error itself
+        }
+        if (!std::holds_alternative<distdb::InsertStatement>(stmt)) continue;
+        auto key = sql.TryExtractRowKey(stmt);
+        if (key && engine.Get(*key).has_value()) {
+            return "duplicate primary key in staged command '" + cmd + "'";
+        }
+    }
+    return "";
+}
+
 // One entry per buffered write statement between BEGIN and COMMIT: which
 // shard its row key belongs to, that key (for the PREPARE's lock), and
 // the raw SQL line (staged, to actually run once the transaction
@@ -327,7 +357,7 @@ int main(int argc, char** argv) {
         // of the same apply.
         distdb::TxnParticipant txn_participant;
 
-        auto apply_callback = [&sql, &engine_mutex, &txn_participant, node_id](
+        auto apply_callback = [&sql, &engine, &engine_mutex, &txn_participant, node_id](
                                    distdb::LogIndex index, const std::string& command) -> std::string {
             std::lock_guard<std::mutex> lock(engine_mutex);
 
@@ -336,7 +366,10 @@ int main(int argc, char** argv) {
                     case distdb::TxnControlType::kPrepare: {
                         std::cout << "[node " << node_id << "] applying #" << index << ": PREPARE txn "
                                   << control->txn_id << " (" << control->keys.size() << " key(s))\n";
-                        std::string error = txn_participant.Prepare(control->txn_id, control->keys, control->commands);
+                        std::string error = FindStagedDuplicateKey(sql, engine, control->commands);
+                        if (error.empty()) {
+                            error = txn_participant.Prepare(control->txn_id, control->keys, control->commands);
+                        }
                         if (!error.empty()) std::cout << "[node " << node_id << "] prepare vote NO: " << error << "\n";
                         return error;
                     }
