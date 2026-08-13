@@ -270,35 +270,51 @@ so both limits scale with the number of shards instead of staying fixed.
   statement goes through the same local/remote split (`ProposeOrForward`
   or `SendClientRequest` for writes; a direct local `Execute` or
   `SendReadRequest` for a `SELECT`) depending on whether that shard happens
-  to be this node's own. If `TryExtractRowKey` returns nothing, the
-  statement is rejected with a clear error rather than silently run against
-  only the local shard's data - a full cross-shard table scan (fan out to
-  every shard, merge results) isn't implemented yet.
+  to be this node's own.
+- **Scatter/gather**, for when `TryExtractRowKey` returns nothing (no
+  `WHERE <pk> = ...` - a full table scan): `BroadcastWrite` sends a
+  `SELECT`/`UPDATE`/`DELETE` to *every* shard the same way `CREATE TABLE`
+  does (`ProposeOrForward` locally, `SendClientRequest` elsewhere) and
+  reports how many shards applied it (`UPDATE`/`DELETE` need no
+  cross-shard coordination here: each shard independently applies the
+  same `WHERE` predicate to whatever rows it holds, which is correct with
+  no atomicity concerns since shards own disjoint rows - it's N
+  independent single-shard operations, not one distributed one). A
+  scattered `SELECT` instead calls every shard's read path and
+  `MergeSelectResults` concatenates their data rows under one shared
+  header - safe with no de-duplication needed for the same reason.
 
 Verified by hand: a 2-shard, 6-node cluster (3 replicas each, independent
-elections - confirmed by different leaders on each shard) splits the key
-space at `__row__/m`. `CREATE TABLE` sent to either shard shows up on both.
-An `INSERT` for a table whose keys fall in the *other* shard, sent to a
-node in this shard, is transparently forwarded and comes back showing the
-other shard's leader committed it; a `SELECT` for that same row, sent to a
-third node in yet another shard, is forwarded as a read and returns the
-right value. A `SELECT` with no primary-key filter is rejected with a clear
-message instead of silently returning only whatever the local shard has.
+elections - confirmed by different leaders on each shard) splits table
+`orders` at primary key `"m"`, so it genuinely has rows on both shards.
+`CREATE TABLE` sent to either shard shows up on both. An `INSERT` whose key
+falls in the *other* shard, sent to a node in this shard, is transparently
+forwarded and comes back showing the other shard's leader committed it. A
+scattered `SELECT id, val FROM orders` (no `WHERE`), sent to either shard,
+returns all 4 rows merged from both; a scattered `UPDATE ... SET val =
+'bulk'` (still no `WHERE`) reports `OK (applied on 2 shard(s))` and a
+follow-up scattered `SELECT` shows every row updated; a scattered `DELETE
+... WHERE val = 'v1'` removes just that one row (a normal, non-pk `WHERE`,
+evaluated independently by each shard) and a final `SELECT` shows only the
+row that was never a match.
 
 Known simplifications: routing is entirely static (a hand-edited text file,
 no splitting/merging/rebalancing, no replication of the routing table
-itself - see `routing.h`'s doc comment); no cross-shard scatter/gather, so
-`SELECT`/`UPDATE`/`DELETE` without a primary-key equality filter are
-rejected outright rather than fanned out to every shard and merged;
-`SendClientRequest`'s redirect-following loop duplicates
-`RaftNode::ProposeOrForward`'s logic rather than sharing it (the latter can
-also propose locally when this process *is* a member, which the standalone
-version never can, so unifying them isn't quite free); a statement that
-updates exactly one row is atomic (it's a single `Propose()` on one shard),
-but nothing here provides atomicity *across* shards (e.g. a single
-statement's effects spanning two rows in two different shards) - that
-would need real distributed transactions (2PC/Percolator-style), which is
-Phase 4, not this one.
+itself - see `routing.h`'s doc comment); `SendClientRequest`'s redirect-
+following loop duplicates `RaftNode::ProposeOrForward`'s logic rather than
+sharing it (the latter can also propose locally when this process *is* a
+member, which the standalone version never can, so unifying them isn't
+quite free); scatter/gather has no partial-failure story beyond reporting
+which shards failed - if one shard is down, a scattered `UPDATE` still
+applies to the reachable shards and just reports fewer than expected in
+`PARTIAL (...)`, which is *not* atomic across the whole table (some rows
+end up updated, some don't, with no rollback); a statement routed to
+exactly one shard is atomic (a single `Propose()` there), but nothing here
+provides atomicity *across* shards for an operation that's supposed to be
+one indivisible unit spanning several of them (e.g. moving a value between
+two rows that happen to live on different shards) - that needs real
+distributed transactions (2PC/Percolator-style), which is Phase 4, not
+this one.
 
 ## Build
 

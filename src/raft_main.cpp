@@ -107,12 +107,80 @@ void PrintHelp() {
                  "DELETE whose WHERE pins the primary key with '=', is routed to the one\n"
                  "shard that owns it (replicated through Raft the same as a single-shard\n"
                  "cluster, forwarding over the network first if that shard isn't this node's).\n"
-                 "A statement that can't be pinned to one shard (no WHERE <pk> = ...) is\n"
-                 "rejected for now - cross-shard table scans aren't implemented yet.\n"
+                 "Anything else (no WHERE <pk> = ...) is scattered to every shard and the\n"
+                 "results/counts gathered back into one answer.\n"
                  "\n"
                  "  status   show role / term / current leader hint / shard id\n"
                  "  help\n"
                  "  exit\n";
+}
+
+// Result of proposing the same write to every shard: CREATE TABLE (which
+// every shard needs a copy of, since any of them could end up holding
+// rows for it) and a table-wide UPDATE/DELETE (which each shard applies
+// independently to whatever rows it holds - no cross-shard coordination
+// needed, since shards own disjoint rows) both go through this.
+struct BroadcastResult {
+    size_t ok_count = 0;
+    std::vector<std::string> failures;
+};
+
+BroadcastResult BroadcastWrite(distdb::RoutingTable& routing, distdb::RaftNode& node, distdb::ShardId my_shard_id,
+                                const std::string& command, int timeout_ms) {
+    BroadcastResult result;
+    for (auto sid : routing.AllShardIds()) {
+        distdb::ClientResponse resp;
+        if (sid == my_shard_id) {
+            resp = node.ProposeOrForward(command);
+        } else {
+            resp = distdb::SendClientRequest(routing.Shard(sid).peers, command, timeout_ms);
+        }
+        if (resp.success) {
+            result.ok_count++;
+        } else {
+            result.failures.push_back("shard " + std::to_string(sid) + ": " + resp.error);
+        }
+    }
+    return result;
+}
+
+void PrintBroadcastResult(const BroadcastResult& result, const char* verb) {
+    if (result.failures.empty()) {
+        std::cout << "OK (" << verb << " on " << result.ok_count << " shard(s))\n";
+    } else {
+        std::cout << "PARTIAL (" << result.ok_count << " shard(s) ok):";
+        for (const auto& f : result.failures) std::cout << " [" << f << "]";
+        std::cout << "\n";
+    }
+}
+
+// Merges each shard's independently-formatted SELECT result (a header
+// line, then one line per matching row, or "(0 rows)" if none) into one:
+// every shard ran the identical query against the same table, so their
+// headers agree - keep it once - and since shards own disjoint rows,
+// concatenating their data rows needs no de-duplication or re-sorting.
+std::string MergeSelectResults(const std::vector<std::string>& shard_results) {
+    std::string header;
+    std::vector<std::string> data_lines;
+    for (const auto& result : shard_results) {
+        std::istringstream iss(result);
+        std::string line;
+        bool first_line = true;
+        while (std::getline(iss, line)) {
+            if (first_line) {
+                header = line;
+                first_line = false;
+                continue;
+            }
+            if (line == "(0 rows)") continue;
+            data_lines.push_back(line);
+        }
+    }
+    std::ostringstream out;
+    out << header;
+    for (const auto& line : data_lines) out << '\n' << line;
+    if (data_lines.empty()) out << "\n(0 rows)";
+    return out.str();
 }
 
 }  // namespace
@@ -242,39 +310,51 @@ int main(int argc, char** argv) {
                 // holding rows for this table, so every shard needs an
                 // identical copy of it, not just the one (if any) that
                 // would own some specific key.
-                size_t ok_count = 0;
-                std::vector<std::string> failures;
-                for (auto sid : routing.AllShardIds()) {
-                    distdb::ClientResponse resp;
-                    if (sid == shard_id) {
-                        resp = node.ProposeOrForward(line);
-                    } else {
-                        try {
-                            resp = distdb::SendClientRequest(routing.Shard(sid).peers, line, kCrossShardTimeoutMs);
-                        } catch (const std::exception& e) {
-                            resp = {false, 0, true, 0, e.what()};
-                        }
-                    }
-                    if (resp.success) {
-                        ok_count++;
-                    } else {
-                        failures.push_back("shard " + std::to_string(sid) + ": " + resp.error);
-                    }
-                }
-                if (failures.empty()) {
-                    std::cout << "OK (created on " << ok_count << " shard(s))\n";
-                } else {
-                    std::cout << "PARTIAL (" << ok_count << " shard(s) ok):";
-                    for (const auto& f : failures) std::cout << " [" << f << "]";
-                    std::cout << "\n";
-                }
+                PrintBroadcastResult(BroadcastWrite(routing, node, shard_id, line, kCrossShardTimeoutMs), "created");
                 continue;
             }
 
+            bool is_select = std::holds_alternative<distdb::SelectStatement>(parsed);
             auto key = sql.TryExtractRowKey(parsed);
+
             if (!key) {
-                std::cout << "ERROR: cannot route this statement to a single shard (no WHERE <primary-key> = ... "
-                             "condition) - cross-shard table scans aren't supported yet\n";
+                // No WHERE <pk> = ... to pin this to one shard: scatter
+                // to every shard and gather the results/counts back into
+                // one answer, rather than only ever seeing this node's
+                // own shard's slice of the table.
+                if (is_select) {
+                    std::vector<std::string> shard_results;
+                    std::vector<std::string> failures;
+                    for (auto sid : routing.AllShardIds()) {
+                        try {
+                            if (sid == shard_id) {
+                                std::lock_guard<std::mutex> lock(engine_mutex);
+                                shard_results.push_back(sql.Execute(line));
+                            } else {
+                                shard_results.push_back(
+                                    distdb::SendReadRequest(routing.Shard(sid).peers, line, kCrossShardTimeoutMs));
+                            }
+                        } catch (const std::exception& e) {
+                            failures.push_back("shard " + std::to_string(sid) + ": " + e.what());
+                        }
+                    }
+                    if (!failures.empty()) {
+                        std::cout << "ERROR: some shards did not respond:";
+                        for (const auto& f : failures) std::cout << " [" << f << "]";
+                        std::cout << "\n";
+                    } else {
+                        std::cout << MergeSelectResults(shard_results) << "\n";
+                    }
+                } else {
+                    // UPDATE/DELETE without a primary-key filter: each
+                    // shard independently applies the same WHERE
+                    // predicate to whatever rows it holds - correct with
+                    // no cross-shard coordination, since shards own
+                    // disjoint rows (this is not an atomic multi-shard
+                    // transaction, just N independent single-shard ones).
+                    PrintBroadcastResult(BroadcastWrite(routing, node, shard_id, line, kCrossShardTimeoutMs),
+                                         "applied");
+                }
                 continue;
             }
 
@@ -286,7 +366,6 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            bool is_select = std::holds_alternative<distdb::SelectStatement>(parsed);
             bool local = target->id == shard_id;
 
             if (is_select) {
