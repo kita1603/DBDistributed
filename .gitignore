@@ -1,9 +1,18 @@
 build/
+build_vs/
 data/
 *.exe
 *.obj
 *.o
 .vs/
+
+# Visual Studio's own CMake integration config - IDE- and machine-
+# specific (compiler paths, debug args), analogous to config/routing.conf
+CMakeSettings.json
+launch.vs.json
+
+# VS Code debug config - also has a machine-specific absolute gdb path
+.vscode/
 
 # Local scratch state from manual raftnode testing (raft log, kv data)
 node1/
