@@ -216,7 +216,12 @@ instead of streaming; flush/compaction thresholds
 tiny (4) so they're easy to trigger by hand instead of being sized for real
 data volumes; SQL and raw KV commands share one key space, so a raw `put`
 under `__row__/...`/`__schema__/...` could corrupt a table with no
-validation stopping it.
+validation stopping it; `engine_mutex` in `raft_main.cpp` is one single lock
+guarding the *entire* `StorageEngine` for every apply/snapshot/restore/read,
+so two commands touching completely unrelated rows still serialize behind
+each other - a real database gets its concurrency from row-level locking (or
+MVCC, so reads never block writes at all) instead of one coarse lock over
+everything. TODO for later: replace `engine_mutex` with per-row locking.
 
 ## Phase 3: sharding (`src/shard/`)
 
