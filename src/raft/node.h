@@ -5,6 +5,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 
 #include "log.h"
@@ -209,6 +210,13 @@ class RaftNode {
     // Leader-only; reset whenever this node becomes leader.
     std::map<NodeId, LogIndex> next_index_;
     std::map<NodeId, LogIndex> match_index_;
+
+    // Peers with an AppendEntries or InstallSnapshot RPC currently in
+    // flight - checked by ReplicateTo so a heartbeat tick never fires a
+    // second RPC at a peer while an earlier one (possibly still waiting
+    // out its up-to-5s InstallSnapshot timeout) hasn't finished yet. See
+    // ReplicateTo's doc comment for what happens without this guard.
+    std::set<NodeId> replication_in_flight_;
 
     RaftTransport transport_;
 };

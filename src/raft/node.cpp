@@ -51,6 +51,19 @@ RaftNode::RaftNode(NodeId id, uint16_t listen_port, std::map<NodeId, PeerAddress
       transport_(listen_port) {
     state_.Load();
     log_.Load();
+
+    // commit_index_/last_applied_ default to 0 and are never persisted
+    // directly - log_.applied_index() is the durable record of how far
+    // apply_callback_ has actually run (falling back to snapshot_index()
+    // for a log file written before that field existed). Without this a
+    // restarted node forgets its applied boundary and reports 0, which is
+    // exactly what SendInstallSnapshot declares to a follower as
+    // `last_included_index` - reporting 0 there makes a real, non-empty
+    // snapshot look like a no-op to any follower already at or past index
+    // 0 (i.e. every follower), so it's silently skipped instead of
+    // installed.
+    last_applied_ = log_.applied_index();
+    commit_index_ = log_.applied_index();
 }
 
 Role RaftNode::role() const {
@@ -113,6 +126,7 @@ void RaftNode::BecomeLeader() {
     role_ = Role::kLeader;
     leader_hint_ = id_;
     next_heartbeat_time_ = std::chrono::steady_clock::now();  // fire the first replication round on the next tick
+    replication_in_flight_.clear();
     for (const auto& [peer_id, addr] : peers_) {
         (void)addr;
         next_index_[peer_id] = log_.LastIndex() + 1;
@@ -130,6 +144,12 @@ void RaftNode::ApplyCommitted() {
             std::string error = apply_callback_(entry->index, entry->command);
             if (!error.empty()) apply_errors_[entry->index] = std::move(error);
         }
+        // Persisted right after this entry's effect lands, not batched
+        // until the loop ends: if the process crashes partway through a
+        // multi-entry commit, log_.applied_index() must never claim more
+        // than what apply_callback_ actually finished, or a restart would
+        // skip re-running an entry whose effect never actually happened.
+        log_.SetAppliedIndex(last_applied_);
     }
     commit_cv_.notify_all();
 
@@ -335,6 +355,17 @@ void RaftNode::MaybeAdvanceCommitIndex() {
     }
 }
 
+// Sends at most one outstanding RPC to `peer_id` at a time. Without this,
+// TickerLoop's every-75ms heartbeat would spawn a brand new detached
+// thread/connection to the peer on every tick regardless of whether an
+// earlier attempt (possibly still waiting out its own timeout - up to 5s
+// for InstallSnapshot) had finished. Under sustained failure that grows
+// unboundedly: dozens of concurrent connection attempts pile up against
+// the same peer, and in practice that can choke the peer badly enough
+// that *no* RPC to it - including its own outbound RequestVotes - ever
+// gets a chance to complete. replication_in_flight_ is cleared as soon as
+// this peer's one outstanding attempt (of either kind) resolves, by every
+// exit path in the two response-handling threads below.
 void RaftNode::ReplicateTo(NodeId peer_id, const PeerAddress& addr) {
     Term term;
     LogIndex prev_log_index;
@@ -345,6 +376,7 @@ void RaftNode::ReplicateTo(NodeId peer_id, const PeerAddress& addr) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (role_ != Role::kLeader) return;
+        if (replication_in_flight_.count(peer_id)) return;  // still waiting on a prior RPC to this peer
         term = state_.current_term();
         LogIndex next_idx = next_index_[peer_id];
         if (next_idx <= log_.snapshot_index()) {
@@ -362,6 +394,7 @@ void RaftNode::ReplicateTo(NodeId peer_id, const PeerAddress& addr) {
             }
             leader_commit = commit_index_;
         }
+        replication_in_flight_.insert(peer_id);
     }
 
     if (needs_snapshot) {
@@ -378,11 +411,14 @@ void RaftNode::ReplicateTo(NodeId peer_id, const PeerAddress& addr) {
         try {
             response = RaftTransport::SendRequest(addr.host, addr.port, encoded, kRpcTimeoutMs);
         } catch (...) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            replication_in_flight_.erase(peer_id);
             return;  // peer unreachable right now - this round is simply skipped for it
         }
         AppendEntriesResponse resp = DecodeAppendEntriesResponse(response);
 
         std::lock_guard<std::mutex> lock(mutex_);
+        replication_in_flight_.erase(peer_id);
         if (resp.term > state_.current_term()) {
             BecomeFollower(resp.term);
             return;
@@ -416,7 +452,10 @@ void RaftNode::SendInstallSnapshot(NodeId peer_id, const PeerAddress& addr, Term
     std::string data;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (role_ != Role::kLeader || term != state_.current_term()) return;
+        if (role_ != Role::kLeader || term != state_.current_term()) {
+            replication_in_flight_.erase(peer_id);  // ReplicateTo marked it in-flight before calling us
+            return;
+        }
 
         // The declared boundary must be exactly what the dump reflects,
         // not log_.snapshot_index() (which only tracks how far our *log*
@@ -443,11 +482,14 @@ void RaftNode::SendInstallSnapshot(NodeId peer_id, const PeerAddress& addr, Term
         try {
             response = RaftTransport::SendRequest(addr.host, addr.port, encoded, kSnapshotRpcTimeoutMs);
         } catch (...) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            replication_in_flight_.erase(peer_id);
             return;  // peer unreachable right now - retried on a later round
         }
         InstallSnapshotResponse resp = DecodeInstallSnapshotResponse(response);
 
         std::lock_guard<std::mutex> lock(mutex_);
+        replication_in_flight_.erase(peer_id);
         if (resp.term > state_.current_term()) {
             BecomeFollower(resp.term);
             return;
@@ -496,7 +538,16 @@ InstallSnapshotResponse RaftNode::HandleInstallSnapshot(const InstallSnapshotReq
     if (req.last_included_index > log_.snapshot_index()) {
         log_.CompactTo(req.last_included_index, req.last_included_term);
         if (req.last_included_index > commit_index_) commit_index_ = req.last_included_index;
-        if (req.last_included_index > last_applied_) last_applied_ = req.last_included_index;
+        if (req.last_included_index > last_applied_) {
+            last_applied_ = req.last_included_index;
+            // restore_callback_ already replaced the whole state machine
+            // wholesale with this snapshot, so last_applied_ must be
+            // durable now too - otherwise a restart right after this call
+            // would fall back to the old (lower) log_.applied_index() and
+            // re-run apply_callback_ for entries this snapshot's data
+            // already reflects.
+            log_.SetAppliedIndex(last_applied_);
+        }
         commit_cv_.notify_all();
     }
     return {state_.current_term()};

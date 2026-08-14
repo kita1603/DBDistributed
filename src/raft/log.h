@@ -30,6 +30,20 @@ class RaftLog {
     LogIndex snapshot_index() const { return snapshot_index_; }
     Term snapshot_term() const { return snapshot_term_; }
 
+    // The highest index actually handed to the application via
+    // apply_callback_ - persisted separately from snapshot_index_ because
+    // compaction only runs every kCompactionThreshold entries, so on
+    // restart there can be a handful of already-applied entries that
+    // haven't been compacted away yet. Without this, RaftNode would only
+    // know "applied at least up to snapshot_index_" and would re-run
+    // apply_callback_ on that already-applied gap once commit_index_
+    // advances again - harmless for an INSERT (rejected as a duplicate
+    // key) but a real double-apply for something like an UPDATE counter.
+    // Falls back to snapshot_index_ when reading a log file written
+    // before this field existed (see Load()).
+    LogIndex applied_index() const { return applied_index_; }
+    void SetAppliedIndex(LogIndex index);
+
     LogIndex LastIndex() const;  // snapshot_index() if there are no entries past it
     Term LastTerm() const;       // snapshot_term() if there are no entries past it
     Term TermAt(LogIndex index) const;              // 0 if index is before the snapshot or past the end
@@ -71,6 +85,7 @@ class RaftLog {
     LogIndex snapshot_index_ = 0;
     Term snapshot_term_ = 0;
     std::vector<LogEntry> entries_;  // entries_[i] holds log index snapshot_index_ + 1 + i
+    LogIndex applied_index_ = 0;
 };
 
 }  // namespace distdb

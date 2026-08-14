@@ -41,6 +41,14 @@ void RaftLog::Load() {
         if (len > 0) file.read(e.command.data(), len);
         entries_.push_back(std::move(e));
     }
+
+    // Trailing field, added after this format shipped - a log file
+    // written before applied_index_ existed simply ends here. Falling
+    // back to snapshot_index_ (everything compacted is definitely
+    // applied) is the best available answer for such a file, same as
+    // before this field was introduced.
+    ReadRaw(file, applied_index_);
+    if (!file) applied_index_ = snapshot_index_;
 }
 
 LogIndex RaftLog::LastIndex() const { return entries_.empty() ? snapshot_index_ : entries_.back().index; }
@@ -123,8 +131,14 @@ void RaftLog::Save() {
             WriteRaw(file, len);
             file.write(e.command.data(), static_cast<std::streamsize>(e.command.size()));
         }
+        WriteRaw(file, applied_index_);
     }
     std::filesystem::rename(tmp_path, path_);
+}
+
+void RaftLog::SetAppliedIndex(LogIndex index) {
+    applied_index_ = index;
+    Save();
 }
 
 }  // namespace distdb
