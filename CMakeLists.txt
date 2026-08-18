@@ -46,6 +46,8 @@ add_library(distdb_raft
     src/raft/transport.cpp
     src/raft/persistent_state.cpp
     src/raft/log.cpp
+    src/raft/conf_change.cpp
+    src/raft/membership_state.cpp
     src/raft/node.cpp
     src/raft/client.cpp
 )

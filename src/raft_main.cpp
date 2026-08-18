@@ -11,6 +11,8 @@
 #include <vector>
 
 #include "raft/client.h"
+#include "raft/conf_change.h"
+#include "raft/membership_state.h"
 #include "raft/node.h"
 #include "shard/routing.h"
 #include "sql/ast.h"
@@ -120,6 +122,11 @@ void PrintHelp() {
                  "                     across however many shards they touch\n"
                  "  rollback           discard the buffer - nothing was ever sent anywhere\n"
                  "  status             show role / term / current leader hint / shard id\n"
+                 "  add-server <id> <host> <port>\n"
+                 "                     add a server to this shard's Raft group (start it first\n"
+                 "                     with --joining <own-host>)\n"
+                 "  remove-server <id> remove a server from this shard's Raft group (the leader\n"
+                 "                     itself may be removed - it steps down once it commits)\n"
                  "  help\n"
                  "  exit\n";
 }
@@ -317,7 +324,8 @@ int main(int argc, char** argv) {
     std::cout.setf(std::ios::unitbuf);
 
     if (argc < 5) {
-        std::cerr << "usage: raftnode <node-id> <shard-id> <listen-port> <routing-table-path> [state-dir]\n";
+        std::cerr << "usage: raftnode <node-id> <shard-id> <listen-port> <routing-table-path> [state-dir] "
+                      "[--joining <own-host>]\n";
         return 1;
     }
 
@@ -329,16 +337,58 @@ int main(int argc, char** argv) {
         std::string state_dir = argc > 5 ? argv[5] : ".";
         std::filesystem::create_directories(state_dir);
 
+        // A node bootstrapped via --joining isn't listed in anyone's
+        // routing.conf row yet (it's being added at runtime through an
+        // add-server command) - it starts with no known peers and must
+        // be told its own reachable address explicitly, since there's no
+        // other source of truth for it until membership_state_ learns
+        // better from a real leader's AppendEntries/InstallSnapshot.
+        bool joining = false;
+        std::string own_host;
+        if (argc > 6 && std::string(argv[6]) == "--joining") {
+            if (argc <= 7) {
+                std::cerr << "usage: --joining requires an <own-host> argument\n";
+                return 1;
+            }
+            joining = true;
+            own_host = argv[7];
+        }
+
         distdb::RoutingTable routing;
         routing.LoadFromFile(routing_path);
 
+        // A node added via add-server is never listed in routing.conf (it's
+        // a static, hand-edited file this feature deliberately doesn't
+        // touch), so the "must be in routing.conf" check below would wrongly
+        // reject it on every restart *after* the first, not just refuse a
+        // genuine bootstrap. Its own membership file - written the first
+        // time it successfully joined - is what settles that on every later
+        // run, checked here before RaftNode (and hence before
+        // MembershipState::Load()) even exists, so --joining only ever
+        // needs to be passed once.
+        bool has_membership_file =
+            std::filesystem::exists(distdb::MembershipState::PathFor(state_dir, node_id));
+
         const auto& my_shard = routing.Shard(shard_id);
-        if (my_shard.peers.find(node_id) == my_shard.peers.end()) {
-            throw std::runtime_error("node " + std::to_string(node_id) + " is not listed as a peer of shard " +
-                                      std::to_string(shard_id) + " in " + routing_path);
+        distdb::PeerAddress own_address;
+        std::map<distdb::NodeId, distdb::PeerAddress> peers_in_shard;
+        if (has_membership_file) {
+            // Already run (and been added) before - RaftNode's constructor
+            // will load the real membership from its own file and ignore
+            // these; routing.conf doesn't need to (and generally won't)
+            // list this node at all.
+            own_address = {"", port};
+        } else if (joining) {
+            own_address = {own_host, port};
+        } else {
+            if (my_shard.peers.find(node_id) == my_shard.peers.end()) {
+                throw std::runtime_error("node " + std::to_string(node_id) + " is not listed as a peer of shard " +
+                                          std::to_string(shard_id) + " in " + routing_path);
+            }
+            own_address = my_shard.peers.at(node_id);
+            peers_in_shard = my_shard.peers;
+            peers_in_shard.erase(node_id);  // RaftNode's peers_ convention: exclude self
         }
-        std::map<distdb::NodeId, distdb::PeerAddress> peers_in_shard = my_shard.peers;
-        peers_in_shard.erase(node_id);  // RaftNode's peers_ convention: exclude self
 
         distdb::StorageEngine engine(state_dir + "/kv");
         engine.Open();
@@ -428,8 +478,8 @@ int main(int argc, char** argv) {
             return sql.Execute(query);
         };
 
-        distdb::RaftNode node(node_id, port, peers_in_shard, state_dir, apply_callback, snapshot_callback,
-                               restore_callback, read_callback);
+        distdb::RaftNode node(node_id, port, own_address, peers_in_shard, state_dir, joining, apply_callback,
+                              snapshot_callback, restore_callback, read_callback);
 
         std::cout << "raftnode " << node_id << " (shard " << shard_id << ") listening on port " << port << "\n";
         node.Run();
@@ -500,6 +550,28 @@ int main(int argc, char** argv) {
                     std::cout << RunTransaction(routing, node, shard_id, txn_id, txn_buffer, kCrossShardTimeoutMs)
                               << "\n";
                     txn_buffer.clear();
+                }
+                continue;
+            } else if (first_word == "add-server") {
+                unsigned long new_id_raw = 0, new_port_raw = 0;
+                std::string host;
+                if (!(iss >> new_id_raw >> host >> new_port_raw)) {
+                    std::cout << "ERROR: usage: add-server <id> <host> <port>\n";
+                } else {
+                    distdb::ConfChangeCommand cc{distdb::ConfChangeType::kAddServer,
+                                                  static_cast<distdb::NodeId>(new_id_raw), host,
+                                                  static_cast<uint16_t>(new_port_raw)};
+                    PrintClientResponse(node.ProposeOrForward(distdb::EncodeConfChange(cc)));
+                }
+                continue;
+            } else if (first_word == "remove-server") {
+                unsigned long target_id_raw = 0;
+                if (!(iss >> target_id_raw)) {
+                    std::cout << "ERROR: usage: remove-server <id>\n";
+                } else {
+                    distdb::ConfChangeCommand cc{distdb::ConfChangeType::kRemoveServer,
+                                                  static_cast<distdb::NodeId>(target_id_raw), "", 0};
+                    PrintClientResponse(node.ProposeOrForward(distdb::EncodeConfChange(cc)));
                 }
                 continue;
             }

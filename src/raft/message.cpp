@@ -8,6 +8,7 @@ namespace distdb {
 namespace {
 
 void AppendU8(std::string& out, uint8_t v) { out.push_back(static_cast<char>(v)); }
+void AppendU16(std::string& out, uint16_t v) { out.append(reinterpret_cast<const char*>(&v), sizeof(v)); }
 void AppendU32(std::string& out, uint32_t v) { out.append(reinterpret_cast<const char*>(&v), sizeof(v)); }
 void AppendU64(std::string& out, uint64_t v) { out.append(reinterpret_cast<const char*>(&v), sizeof(v)); }
 void AppendString(std::string& out, const std::string& s) {
@@ -25,6 +26,13 @@ class Reader {
         Check(1);
         uint8_t v = static_cast<uint8_t>(buf_[pos_]);
         pos_ += 1;
+        return v;
+    }
+    uint16_t ReadU16() {
+        Check(sizeof(uint16_t));
+        uint16_t v;
+        std::memcpy(&v, buf_.data() + pos_, sizeof(v));
+        pos_ += sizeof(v);
         return v;
     }
     uint32_t ReadU32() {
@@ -206,6 +214,12 @@ std::string EncodeInstallSnapshotRequest(const InstallSnapshotRequest& req) {
     AppendU64(out, req.last_included_index);
     AppendU64(out, req.last_included_term);
     AppendString(out, req.data);
+    AppendU32(out, static_cast<uint32_t>(req.membership.size()));
+    for (const auto& [id, addr] : req.membership) {
+        AppendU32(out, id);
+        AppendString(out, addr.host);
+        AppendU16(out, addr.port);
+    }
     return out;
 }
 
@@ -218,6 +232,13 @@ InstallSnapshotRequest DecodeInstallSnapshotRequest(const std::string& body) {
     req.last_included_index = r.ReadU64();
     req.last_included_term = r.ReadU64();
     req.data = r.ReadString();
+    uint32_t count = r.ReadU32();
+    for (uint32_t i = 0; i < count; i++) {
+        NodeId id = r.ReadU32();
+        std::string host = r.ReadString();
+        uint16_t port = r.ReadU16();
+        req.membership[id] = {host, port};
+    }
     return req;
 }
 

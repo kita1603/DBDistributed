@@ -411,6 +411,124 @@ key, etc.) would need PREPARE to validate against all of them the same way,
 or a shard's batch could still see a command fail partway through COMMIT
 with nothing before it undone.
 
+## Phase 5: cluster membership changes (`src/raft/conf_change.h`, `membership_state.h`)
+
+Until this phase, a shard's Raft group (`peers_` in `RaftNode`) was fixed at
+process startup from `config/routing.conf` - adding, removing, or replacing a
+node meant stopping every process in that shard, hand-editing the routing
+file, and restarting all of them. This phase adds two new REPL commands,
+`add-server <id> <host> <port>` and `remove-server <id>`, that change a
+running shard's membership one server at a time with no downtime - scoped
+deliberately narrow, matching what etcd/raft and HashiCorp raft actually ship
+rather than the original Raft paper's more general joint-consensus algorithm:
+
+- **Single-server-at-a-time only.** Provably safe on its own - the old and
+  new majority always overlap by at least one node when only one server
+  changes at a time - so no joint (`C_old,new`) intermediate configuration is
+  needed. `Propose()` rejects a second membership-change command while one is
+  already pending (proposed but not yet committed).
+- **One shard at a time.** Each shard's `RaftNode` already owns an
+  independent `peers_`/`RaftTransport`, so this is naturally shard-scoped.
+- Explicitly **not** attempted here: dynamic resharding (splitting/merging a
+  shard's key range - a separate, much larger follow-up), a "learner"
+  catch-up phase before a new server counts toward majority, or graceful
+  process shutdown after a node removes itself (it just stops participating).
+
+A membership change is encoded exactly like a txn control command
+(`src/txn/txn.h`'s pattern): an opaque log entry with a reserved leading tag
+byte - `0x01` (txn control commands already claim `0x00`; no real SQL text
+can start with either) - carrying an add/remove type, the target node id,
+and (for add) its address. It flows through the exact same
+`Propose`/`AppendEntries`/`ApplyCommitted` pipeline as any SQL statement, with
+one difference: `ApplyCommitted()` recognizes the tag and never hands it to
+`apply_callback_` - membership is a pure Raft concept, unrelated to the
+SQL/txn state machine.
+
+Per the Raft paper (section 4.1), a server must use the latest configuration
+in its own log for vote-counting and replication targets *regardless of
+whether that entry is committed* - so `RaftNode::RefreshMembership()` updates
+`peers_` (and, for a newly added peer, seeds `next_index_`/`match_index_`) at
+**append** time, not commit time, on both the leader (right after
+`log_.Append()`) and every follower (right after a successful
+`AppendEntriesFrom()`). It recomputes membership from scratch every call -
+`membership_state_`'s persisted base (the compacted-history counterpart to
+`RaftLog::snapshot_index()`, needed for the same reason
+`RaftLog::applied_index_` is) folded with every `ConfChangeCommand` still
+present in the log - rather than patching incrementally, so a conflicting
+`AppendEntriesFrom` truncation of an uncommitted change simply stops being
+seen on the next call, with no special revert logic needed.
+
+The one place append-time effect would be actively unsafe is a **leader
+removing itself**: stepping down immediately would stop it from
+heartbeating, which would stop that very entry from ever gathering a
+majority, stranding it forever (section 4.3). So self-removal only records
+`pending_self_removal_index_` at append time and doesn't act on it - actual
+step-down happens in `MaybeAdvanceCommitIndex()`, once `commit_index_`
+actually reaches that entry. A follower being removed has no such
+obligation and reflects it immediately.
+
+A follower installing an `InstallSnapshot` may have no relevant local log to
+derive membership from at all (a badly-diverged follower's log gets
+discarded wholesale by `RaftLog::CompactTo`) - so `InstallSnapshotRequest`
+now also carries the leader's current membership, self-inclusive (a follower
+joining fresh has no other way to learn the leader's own address), adopted
+wholesale rather than folded.
+
+A node being added via `add-server` isn't listed in anyone's `routing.conf`
+row - `raftnode.exe` accepts an optional trailing `--joining <own-host>`
+argument for exactly this bootstrap case: it skips the "must be in
+routing.conf" check and starts with an empty peer set, and (via
+`self_is_member_`/`joining_`) refuses to self-elect until a real leader's
+`AppendEntries`/`InstallSnapshot` tells it otherwise. `--joining` only
+matters for a node's *first* run - `membership_state_`'s persisted file
+(once it exists) is authoritative on every restart after that, checked in
+`main()` before a `RaftNode` even exists (`MembershipState::PathFor`).
+
+Verified by hand (`local_test/`, extended with a 3rd/4th node): a fresh node
+started with `--joining` catches up via plain `AppendEntries` replay when
+added before any compaction has happened, and via `InstallSnapshot` when
+added after the leader's log has already compacted past it; `add-server`
+naming an existing peer, or `remove-server` naming an unknown id, is
+rejected immediately with a specific error (not a generic timeout);
+`remove-server` targeting the *current leader itself* - the critical
+append-vs-commit timing case - returns `OK` (the entry genuinely commits)
+and that node's own `status` shows `role=follower` shortly after, with the
+remaining nodes electing a new leader and continuing to take writes
+(including replicating them to a previously-added node).
+
+**Known limitation, demonstrated, not just theoretical**: a leader removes a
+target from its own `peers_` at *append* time - before that target could
+possibly have received the very entry that removes it (see
+`RefreshMembership`'s doc comment). A removed node therefore never learns
+it's been removed: it never gets `AppendEntries` again (the leader stops
+targeting it), so its own election timeout fires forever, and it repeatedly
+sends `RequestVote` at ever-increasing terms to whichever servers remain
+reachable from its own stale peer list. This can't corrupt data or violate
+Raft's safety guarantees - `AppendEntries`'s consistency check still refuses
+to let a rogue "leader" overwrite a real member's more-advanced log - but
+without a mitigation it *is* disruptive: every real member still has to
+answer each `RequestVote`, and (observed by hand) can end up bouncing through
+several unnecessary elections in a row. The mitigation actually implemented,
+`last_leader_contact_` in `node.cpp`, is the one the Raft thesis recommends
+for exactly this situation (section 9.6, "Disruptive servers"): a server
+that has heard from a real leader within the last minimum election timeout
+ignores `RequestVote` entirely, so a disruptive candidate can't force a
+term bump as long as the real leader keeps heartbeating - confirmed by hand
+to turn a several-term cascade into a single clean re-election. This is a
+mitigation, not a fix: the removed node still retries forever in the
+background, it's just harmless to the healthy cluster as long that cluster
+has a live leader. **An operator who removes a server should still stop that
+process** rather than leave it running - there's no notification mechanism
+today, and a real fix (PreVote, or an explicit removal handshake) is a
+separate, larger undertaking than this increment.
+
+Also unaddressed: `config/routing.conf` (used only for *cross-shard* request
+forwarding) isn't updated by any of this - after a membership change, another
+shard's stale copy can fail to find a newly-added node by id. This isn't
+silently wrong (it surfaces as a clear "unknown node id" error from
+`SendClientRequest`), but fixing it for real means replicating routing state
+itself, which is dynamic resharding's job, not this increment's.
+
 ## Build
 
 Requires a C++17 compiler, CMake >= 3.16, and Ninja.

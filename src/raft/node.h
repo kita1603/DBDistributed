@@ -9,6 +9,7 @@
 #include <string>
 
 #include "log.h"
+#include "membership_state.h"
 #include "message.h"
 #include "persistent_state.h"
 #include "transport.h"
@@ -101,9 +102,24 @@ using ReadCallback = std::function<std::string(const std::string& query)>;
 // SnapshotCallback/RestoreCallback, which can also be slow - so one
 // slow/unreachable peer, or one slow snapshot, never blocks the rest of
 // the node.
+//
+// peers_ is no longer immutable after construction (Phase 5): a
+// ConfChangeCommand log entry (see conf_change.h) can add or remove an
+// entry at runtime, applied via RefreshMembership() - see that method's
+// doc comment for the append-time-vs-commit-time timing rule this relies
+// on for safety.
 class RaftNode {
  public:
-    RaftNode(NodeId id, uint16_t listen_port, std::map<NodeId, PeerAddress> peers, std::string state_dir,
+    // `own_address` is how peers should reach this node - needed so a
+    // leader can tell a snapshot-installing follower how to reach every
+    // current member, itself included (see SendInstallSnapshot). `joining`
+    // marks a node that isn't listed in anyone's configuration yet (being
+    // bootstrapped via an external add-server command): it starts with an
+    // empty `peers` map and must not self-elect until it learns real
+    // membership from a leader - see StartElection()'s self_is_member_
+    // guard.
+    RaftNode(NodeId id, uint16_t listen_port, PeerAddress own_address, std::map<NodeId, PeerAddress> peers,
+             std::string state_dir, bool joining = false,
              ApplyCallback apply_callback = [](LogIndex, const std::string&) { return std::string(); },
              SnapshotCallback snapshot_callback = [] { return std::string(); },
              RestoreCallback restore_callback = [](const std::string&) {},
@@ -169,8 +185,33 @@ class RaftNode {
     void BecomeLeader();
     void ResetElectionDeadline();
 
+    // Recomputes peers_ (and, when this node is currently leader,
+    // next_index_/match_index_) from scratch: membership_state_'s
+    // persisted base_peers_/self_is_member_, folded with every
+    // ConfChangeCommand found scanning log_ from just past
+    // log_.snapshot_index() through log_.LastIndex(), in order.
+    // Recomputing from scratch rather than incrementally patching is what
+    // makes this correct under log truncation with no special revert
+    // logic: a conflicting AppendEntriesFrom truncation simply removes an
+    // uncommitted ConfChange entry from what gets scanned next time - safe
+    // because Leader Completeness guarantees only uncommitted entries can
+    // ever be truncated, and an uncommitted one was never reported to any
+    // client as having succeeded.
+    //
+    // Applies membership changes at *append* time (per the Raft paper's
+    // section 4.1: a server always uses the latest configuration in its
+    // own log, committed or not) - except for this node's own removal
+    // while it's leader, which only sets pending_self_removal_index_ here
+    // and doesn't actually step down until that index commits (checked in
+    // MaybeAdvanceCommitIndex): stepping down on append could strand the
+    // removal entry at less-than-majority replication forever, since a
+    // leader that's already stopped heartbeating can never gather the ack
+    // that would let its own removal commit (section 4.3).
+    void RefreshMembership();
+
     NodeId id_;
     uint16_t listen_port_;
+    PeerAddress own_address_;
     std::map<NodeId, PeerAddress> peers_;
     ApplyCallback apply_callback_;
     SnapshotCallback snapshot_callback_;
@@ -191,10 +232,32 @@ class RaftNode {
     std::condition_variable commit_cv_;
     PersistentState state_;
     RaftLog log_;
+    MembershipState membership_state_;
     Role role_ = Role::kFollower;
     NodeId leader_hint_ = 0;
     LogIndex commit_index_ = 0;
     LogIndex last_applied_ = 0;
+
+    // Whether this node itself is currently a member of the cluster,
+    // mirrored from membership_state_.self_is_member() and kept in sync
+    // by RefreshMembership()/MaybeAdvanceCommitIndex(). A node that isn't
+    // a member (removed, or still `joining_` and not yet added) must
+    // never start an election - see StartElection().
+    bool self_is_member_ = true;
+    // Index of a not-yet-committed ConfChangeCommand that removes this
+    // node itself while it's leader - 0 means none pending. Set by
+    // RefreshMembership() at append time; acted on (actual step-down)
+    // only once MaybeAdvanceCommitIndex() sees commit_index_ reach it -
+    // see RefreshMembership()'s doc comment for why this can't happen
+    // immediately on append.
+    LogIndex pending_self_removal_index_ = 0;
+    // True only for a node bootstrapped via --joining: it starts with an
+    // empty peers_ and must not self-elect (including the single-node-
+    // cluster shortcut in StartElection()) until a real leader's
+    // AppendEntries/InstallSnapshot has told it its actual membership.
+    // Irrelevant after the first successful RefreshMembership() confirms
+    // self_is_member_.
+    bool joining_ = false;
 
     // Non-empty entries are indices whose apply_callback_ call returned
     // an error (e.g. duplicate key) - looked up by Propose() right after
@@ -206,6 +269,39 @@ class RaftNode {
     std::chrono::steady_clock::time_point election_deadline_;
     std::chrono::steady_clock::time_point next_heartbeat_time_;
     int votes_received_ = 0;
+
+    // Set whenever a genuine AppendEntries/InstallSnapshot from a
+    // currently-valid-termed leader is accepted (regardless of whether
+    // the entries themselves matched) - checked by HandleRequestVote to
+    // refuse votes for a little while after hearing from a real leader.
+    // Default-constructed to the epoch (long ago), so a freshly started
+    // or restarted node never spuriously refuses a legitimate election.
+    //
+    // This exists specifically because Phase 5 makes a new failure mode
+    // possible: a node removed via ConfChangeCommand is cut from the
+    // leader's peers_ at append time, before it could possibly have
+    // received that very entry (see RefreshMembership()'s doc comment) -
+    // so it never learns it's been removed, never gets AppendEntries
+    // again, and its own election timeout fires forever, repeatedly
+    // sending RequestVote at ever-increasing terms to the servers that
+    // remain. HandleRequestVote alone has no way to reject an
+    // "illegitimate" candidate (a node's own peers_ can legitimately
+    // differ transiently during any membership change, so "is the
+    // candidate someone I currently recognize" isn't a safe test) - but
+    // this is exactly the mitigation the Raft thesis recommends for this
+    // situation (section 9.6, "Disruptive servers"): a server that has
+    // heard from a real leader recently simply ignores RequestVote
+    // entirely, so a disruptive candidate can never force an unnecessary
+    // term bump/re-election as long as the real leader keeps
+    // heartbeating. It doesn't prevent the disruptive node from
+    // *existing* or retrying forever, but it stops it from actually
+    // costing the healthy cluster anything as long as a real leader is
+    // alive - only a genuine leader outage (no contact for a full
+    // election timeout) ever lets a new election actually proceed. This
+    // is a mitigation, not a fix: an operator who removes a server should
+    // still stop that process rather than leave it running - see the
+    // Phase 5 section of README.md.
+    std::chrono::steady_clock::time_point last_leader_contact_;
 
     // Leader-only; reset whenever this node becomes leader.
     std::map<NodeId, LogIndex> next_index_;

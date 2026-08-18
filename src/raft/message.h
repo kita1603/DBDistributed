@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -74,12 +75,19 @@ struct ClientResponse {
 // the whole state machine as of `last_included_index`/`last_included_term`,
 // produced by the application's SnapshotCallback; the receiver hands it to
 // its own RestoreCallback to adopt it wholesale.
+// `membership` is the sender's current effective cluster membership,
+// self-inclusive (the leader's own peers_ plus its own id/address) - unlike
+// AppendEntries-driven membership updates (which a follower derives itself
+// by folding ConfChange log entries), a follower installing a snapshot may
+// have no usable local log to fold from at all, so it adopts this wholesale
+// instead, exactly like it adopts `data` wholesale.
 struct InstallSnapshotRequest {
     Term term = 0;
     NodeId leader_id = 0;
     LogIndex last_included_index = 0;
     Term last_included_term = 0;
     std::string data;
+    std::map<NodeId, PeerAddress> membership;
 };
 
 struct InstallSnapshotResponse {

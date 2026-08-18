@@ -5,6 +5,8 @@
 #include <random>
 #include <thread>
 
+#include "conf_change.h"
+
 namespace distdb {
 
 namespace {
@@ -36,11 +38,12 @@ int RandomElectionTimeoutMs() {
 
 }  // namespace
 
-RaftNode::RaftNode(NodeId id, uint16_t listen_port, std::map<NodeId, PeerAddress> peers, std::string state_dir,
-                    ApplyCallback apply_callback, SnapshotCallback snapshot_callback,
-                    RestoreCallback restore_callback, ReadCallback read_callback)
+RaftNode::RaftNode(NodeId id, uint16_t listen_port, PeerAddress own_address, std::map<NodeId, PeerAddress> peers,
+                    std::string state_dir, bool joining, ApplyCallback apply_callback,
+                    SnapshotCallback snapshot_callback, RestoreCallback restore_callback, ReadCallback read_callback)
     : id_(id),
       listen_port_(listen_port),
+      own_address_(std::move(own_address)),
       peers_(std::move(peers)),
       apply_callback_(std::move(apply_callback)),
       snapshot_callback_(std::move(snapshot_callback)),
@@ -48,9 +51,29 @@ RaftNode::RaftNode(NodeId id, uint16_t listen_port, std::map<NodeId, PeerAddress
       read_callback_(std::move(read_callback)),
       state_(state_dir + "/raft_state_" + std::to_string(id) + ".txt"),
       log_(state_dir + "/raft_log_" + std::to_string(id) + ".bin"),
+      membership_state_(MembershipState::PathFor(state_dir, id)),
+      joining_(joining),
       transport_(listen_port) {
     state_.Load();
     log_.Load();
+    membership_state_.Load();
+
+    if (membership_state_.HasFile()) {
+        // Not this node's first-ever run: membership_state_ is
+        // authoritative over whatever the caller's `peers`/`joining` args
+        // happen to be (typically routing.conf, which is only a bootstrap
+        // seed good for the very first run - it's never updated after a
+        // membership change).
+        peers_ = membership_state_.base_peers();
+        self_is_member_ = membership_state_.self_is_member();
+        joining_ = false;
+    } else {
+        // First-ever run: seed membership_state_ from the constructor's
+        // args and persist immediately, so a crash right after this
+        // doesn't lose the seed.
+        self_is_member_ = !joining_;
+        membership_state_.Set(peers_, self_is_member_);
+    }
 
     // commit_index_/last_applied_ default to 0 and are never persisted
     // directly - log_.applied_index() is the durable record of how far
@@ -123,6 +146,7 @@ void RaftNode::BecomeFollower(Term term) {
 }
 
 void RaftNode::BecomeLeader() {
+    RefreshMembership();  // defensive - make sure peers_ reflects the log before resetting per-peer state below
     role_ = Role::kLeader;
     leader_hint_ = id_;
     next_heartbeat_time_ = std::chrono::steady_clock::now();  // fire the first replication round on the next tick
@@ -140,7 +164,11 @@ void RaftNode::ApplyCommitted() {
     while (last_applied_ < commit_index_) {
         last_applied_++;
         auto entry = log_.At(last_applied_);
-        if (entry) {
+        // A ConfChangeCommand is pure Raft-internal plumbing, already
+        // fully handled by RefreshMembership() at append time - it has
+        // nothing to do with the SQL/txn state machine and must never
+        // reach apply_callback_ (which knows nothing about tag byte 0x01).
+        if (entry && !TryDecodeConfChange(entry->command)) {
             std::string error = apply_callback_(entry->index, entry->command);
             if (!error.empty()) apply_errors_[entry->index] = std::move(error);
         }
@@ -163,6 +191,41 @@ void RaftNode::ApplyCommitted() {
     // state-machine dump.
     if (last_applied_ - log_.snapshot_index() >= kCompactionThreshold) {
         LogIndex old_snapshot_index = log_.snapshot_index();
+
+        // Fold any ConfChangeCommands about to be compacted away into
+        // membership_state_'s persisted base first - once CompactTo()
+        // runs, log_.At() can never see them again, so whatever they
+        // changed about membership would otherwise be forgotten across a
+        // restart (same reason log_.applied_index() needs its own
+        // persisted field distinct from snapshot_index_). Every entry in
+        // this range is already committed (ApplyCommitted only reaches
+        // entries up to commit_index_), so unlike RefreshMembership()
+        // there's no append-vs-commit timing subtlety to worry about here.
+        std::map<NodeId, PeerAddress> new_base = membership_state_.base_peers();
+        bool new_base_self_member = membership_state_.self_is_member();
+        bool membership_changed = false;
+        for (LogIndex i = old_snapshot_index + 1; i <= last_applied_; i++) {
+            auto entry = log_.At(i);
+            if (!entry) continue;
+            auto cc = TryDecodeConfChange(entry->command);
+            if (!cc) continue;
+            membership_changed = true;
+            if (cc->type == ConfChangeType::kAddServer) {
+                if (cc->server_id == id_) {
+                    new_base_self_member = true;
+                } else {
+                    new_base[cc->server_id] = {cc->host, cc->port};
+                }
+            } else {
+                if (cc->server_id == id_) {
+                    new_base_self_member = false;
+                } else {
+                    new_base.erase(cc->server_id);
+                }
+            }
+        }
+        if (membership_changed) membership_state_.Set(std::move(new_base), new_base_self_member);
+
         log_.CompactTo(last_applied_, log_.TermAt(last_applied_));
         // Prune up to the *previous* boundary, not the new one: the
         // entries between them (including whatever was just applied
@@ -176,8 +239,81 @@ void RaftNode::ApplyCommitted() {
     }
 }
 
+void RaftNode::RefreshMembership() {
+    std::map<NodeId, PeerAddress> effective = membership_state_.base_peers();
+    bool effective_self_member = membership_state_.self_is_member();
+    pending_self_removal_index_ = 0;
+
+    for (LogIndex i = log_.snapshot_index() + 1; i <= log_.LastIndex(); i++) {
+        auto entry = log_.At(i);
+        if (!entry) continue;
+        auto cc = TryDecodeConfChange(entry->command);
+        if (!cc) continue;
+
+        if (cc->type == ConfChangeType::kAddServer) {
+            if (cc->server_id == id_) {
+                effective_self_member = true;
+                pending_self_removal_index_ = 0;  // supersedes any earlier pending self-removal
+            } else {
+                effective[cc->server_id] = {cc->host, cc->port};
+            }
+        } else {  // kRemoveServer
+            if (cc->server_id == id_) {
+                if (role_ == Role::kLeader && commit_index_ < i) {
+                    // Leader removing itself can't act on it until this
+                    // entry actually commits - see this method's doc
+                    // comment in node.h for why.
+                    pending_self_removal_index_ = i;
+                } else {
+                    // Either not leader (no obligation to keep acting as
+                    // a member past append time), or already committed -
+                    // safe to reflect immediately.
+                    effective_self_member = false;
+                }
+            } else {
+                effective.erase(cc->server_id);
+            }
+        }
+    }
+
+    self_is_member_ = effective_self_member;
+
+    for (const auto& [pid, addr] : effective) {
+        bool is_new = !peers_.count(pid);
+        peers_[pid] = addr;
+        if (is_new && role_ == Role::kLeader) {
+            // A brand-new peer has zero state, so seed low - this lets
+            // ReplicateTo's needs_snapshot check pick the right catch-up
+            // path (full log replay or InstallSnapshot) on the very first
+            // attempt, instead of linearly backing off one index per
+            // heartbeat from a guess that's certainly too high.
+            next_index_[pid] = 1;
+            match_index_[pid] = 0;
+        }
+    }
+    for (auto it = peers_.begin(); it != peers_.end();) {
+        if (!effective.count(it->first)) {
+            next_index_.erase(it->first);
+            match_index_.erase(it->first);
+            replication_in_flight_.erase(it->first);
+            it = peers_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 RequestVoteResponse RaftNode::HandleRequestVote(const RequestVoteRequest& req) {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    // Raft thesis section 9.6's mitigation for disruptive servers: if a
+    // real leader has been in contact recently, ignore this vote request
+    // entirely (not even a term comparison) - see last_leader_contact_'s
+    // doc comment in node.h for why this matters once servers can be
+    // removed.
+    if (std::chrono::steady_clock::now() - last_leader_contact_ < std::chrono::milliseconds(kElectionTimeoutMinMs)) {
+        return {state_.current_term(), false};
+    }
 
     if (req.term < state_.current_term()) {
         return {state_.current_term(), false};
@@ -217,12 +353,14 @@ AppendEntriesResponse RaftNode::HandleAppendEntries(const AppendEntriesRequest& 
         BecomeFollower(req.term);
     }
     ResetElectionDeadline();
+    last_leader_contact_ = std::chrono::steady_clock::now();
     leader_hint_ = req.leader_id;
 
     bool ok = log_.AppendEntriesFrom(req.prev_log_index, req.prev_log_term, req.entries);
     if (!ok) {
         return {state_.current_term(), false, 0};
     }
+    RefreshMembership();
 
     if (req.leader_commit > commit_index_) {
         commit_index_ = std::min(req.leader_commit, log_.LastIndex());
@@ -264,6 +402,15 @@ void RaftNode::StartElection() {
     Term last_term;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        RefreshMembership();
+        if (!self_is_member_) {
+            // Not (or no longer, or not yet) a member of this cluster -
+            // removed nodes and nodes still --joining must never
+            // self-elect. Reset the deadline so TickerLoop doesn't just
+            // call back in here every single tick.
+            ResetElectionDeadline();
+            return;
+        }
         state_.Set(state_.current_term() + 1, id_);
         role_ = Role::kCandidate;
         votes_received_ = 1;  // votes for itself
@@ -352,6 +499,22 @@ void RaftNode::MaybeAdvanceCommitIndex() {
     if (majority_index > commit_index_ && log_.TermAt(majority_index) == state_.current_term()) {
         commit_index_ = majority_index;
         ApplyCommitted();
+
+        // A leader that proposed its own removal must not stop leading
+        // until that removal actually commits - see RefreshMembership()'s
+        // doc comment for why stepping down at append time instead could
+        // strand the entry below majority forever. Once commit_index_
+        // catches up, re-derive membership so self_is_member_ flips
+        // immediately, rather than waiting for the next unrelated
+        // Propose()/AppendEntries call to happen to notice.
+        if (pending_self_removal_index_ != 0 && commit_index_ >= pending_self_removal_index_) {
+            bool was_leader = role_ == Role::kLeader;
+            RefreshMembership();
+            if (was_leader && !self_is_member_) {
+                role_ = Role::kFollower;
+                std::cout << "[node " << id_ << "] removed from the cluster - stepping down\n";
+            }
+        }
     }
 }
 
@@ -419,6 +582,7 @@ void RaftNode::ReplicateTo(NodeId peer_id, const PeerAddress& addr) {
 
         std::lock_guard<std::mutex> lock(mutex_);
         replication_in_flight_.erase(peer_id);
+        if (!peers_.count(peer_id)) return;  // this peer isn't part of the cluster anymore
         if (resp.term > state_.current_term()) {
             BecomeFollower(resp.term);
             return;
@@ -450,6 +614,7 @@ void RaftNode::SendInstallSnapshot(NodeId peer_id, const PeerAddress& addr, Term
     LogIndex snapshot_index;
     Term snapshot_term;
     std::string data;
+    std::map<NodeId, PeerAddress> membership;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (role_ != Role::kLeader || term != state_.current_term()) {
@@ -473,9 +638,17 @@ void RaftNode::SendInstallSnapshot(NodeId peer_id, const PeerAddress& addr, Term
         snapshot_index = last_applied_;
         snapshot_term = log_.TermAt(snapshot_index);
         data = snapshot_callback_();
+
+        // Self-inclusive from the sender's point of view: a follower
+        // installing a snapshot may have no relevant local log to derive
+        // membership from at all (see HandleInstallSnapshot), so it needs
+        // to be told every current member's address, including ours -
+        // nothing else tells it how to reach the leader itself.
+        membership = peers_;
+        membership[id_] = own_address_;
     }
 
-    std::string encoded = EncodeInstallSnapshotRequest({term, id_, snapshot_index, snapshot_term, data});
+    std::string encoded = EncodeInstallSnapshotRequest({term, id_, snapshot_index, snapshot_term, data, membership});
 
     std::thread([this, peer_id, addr, encoded, term, snapshot_index] {
         std::string response;
@@ -490,6 +663,7 @@ void RaftNode::SendInstallSnapshot(NodeId peer_id, const PeerAddress& addr, Term
 
         std::lock_guard<std::mutex> lock(mutex_);
         replication_in_flight_.erase(peer_id);
+        if (!peers_.count(peer_id)) return;  // this peer isn't part of the cluster anymore
         if (resp.term > state_.current_term()) {
             BecomeFollower(resp.term);
             return;
@@ -520,6 +694,7 @@ InstallSnapshotResponse RaftNode::HandleInstallSnapshot(const InstallSnapshotReq
             BecomeFollower(req.term);
         }
         ResetElectionDeadline();
+        last_leader_contact_ = std::chrono::steady_clock::now();
         leader_hint_ = req.leader_id;
 
         if (req.last_included_index <= log_.snapshot_index()) {
@@ -548,6 +723,18 @@ InstallSnapshotResponse RaftNode::HandleInstallSnapshot(const InstallSnapshotReq
             // already reflects.
             log_.SetAppliedIndex(last_applied_);
         }
+
+        // A follower installing a snapshot may have no usable local log
+        // to fold ConfChangeCommands from at all (CompactTo may have just
+        // discarded everything - see its "badly diverged" branch), so
+        // membership is adopted wholesale from the leader's dump instead,
+        // exactly like `data` itself.
+        bool self_member = req.membership.count(id_) > 0;
+        std::map<NodeId, PeerAddress> stripped = req.membership;
+        stripped.erase(id_);
+        membership_state_.Set(std::move(stripped), self_member);
+        RefreshMembership();
+
         commit_cv_.notify_all();
     }
     return {state_.current_term()};
@@ -570,7 +757,40 @@ bool RaftNode::Propose(const std::string& command, LogIndex* out_index, int time
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (role_ != Role::kLeader) return false;
+
+        // Validated inside this same critical section, not as a separate
+        // pre-check before it: doing it separately would reopen a race
+        // between two concurrent conf-change proposals landing on this
+        // leader at once.
+        if (auto cc = TryDecodeConfChange(command)) {
+            bool pending = false;
+            for (LogIndex i = commit_index_ + 1; i <= log_.LastIndex() && !pending; i++) {
+                auto entry = log_.At(i);
+                if (entry && TryDecodeConfChange(entry->command)) pending = true;
+            }
+            if (pending) {
+                if (out_apply_error) *out_apply_error = "a membership change is already pending";
+                return false;
+            }
+            if (cc->type == ConfChangeType::kAddServer) {
+                if (cc->server_id == id_ || peers_.count(cc->server_id)) {
+                    if (out_apply_error) {
+                        *out_apply_error = "server " + std::to_string(cc->server_id) + " is already a member";
+                    }
+                    return false;
+                }
+            } else {  // kRemoveServer
+                if (cc->server_id != id_ && !peers_.count(cc->server_id)) {
+                    if (out_apply_error) {
+                        *out_apply_error = "server " + std::to_string(cc->server_id) + " is not a member";
+                    }
+                    return false;
+                }
+            }
+        }
+
         index = log_.Append(state_.current_term(), command);
+        RefreshMembership();
         MaybeAdvanceCommitIndex();  // handles the single-node-cluster case immediately
     }
     if (out_index) *out_index = index;
@@ -596,6 +816,12 @@ ClientResponse RaftNode::HandleClientRequest(const ClientRequest& req) {
     std::string apply_error;
     bool ok = Propose(req.command, &index, 2000, &apply_error);
     if (!ok) {
+        if (!apply_error.empty()) {
+            // Propose() rejected this before ever appending it (e.g. a
+            // pending membership change, or an invalid add/remove
+            // target) - a definite, immediate failure, not a timeout.
+            return {false, 0, false, id_, apply_error};
+        }
         // Either the commit wasn't confirmed within the timeout, or
         // this node stopped being leader partway through - either way,
         // from the caller's perspective the outcome is unconfirmed, not
