@@ -43,15 +43,26 @@ class MembershipState {
     bool HasFile() const { return has_file_; }
     const std::map<NodeId, PeerAddress>& base_peers() const { return base_peers_; }
     bool self_is_member() const { return self_is_member_; }
+    // This node's own address, as last known - base_peers() excludes self
+    // (matching RaftNode::peers_'s convention), so without this a node's
+    // own listen address is only ever known via whatever the *caller*
+    // passes on this particular run, forgotten the instant that run's
+    // in-memory state goes away. Needed so a node beyond its first-ever
+    // run - which no longer looks itself up in routing.conf, since
+    // membership_state_ is authoritative from then on - still knows its
+    // own address well enough to answer a DescribeCluster query about
+    // itself.
+    const PeerAddress& own_address() const { return own_address_; }
 
-    // Updates both fields and persists them to disk before returning.
-    void Set(std::map<NodeId, PeerAddress> peers, bool self_is_member);
+    // Updates all three fields and persists them to disk before returning.
+    void Set(std::map<NodeId, PeerAddress> peers, bool self_is_member, PeerAddress own_address);
 
  private:
     std::string path_;
     bool has_file_ = false;
     std::map<NodeId, PeerAddress> base_peers_;
     bool self_is_member_ = true;
+    PeerAddress own_address_;
 };
 
 }  // namespace distdb

@@ -60,19 +60,21 @@ RaftNode::RaftNode(NodeId id, uint16_t listen_port, PeerAddress own_address, std
 
     if (membership_state_.HasFile()) {
         // Not this node's first-ever run: membership_state_ is
-        // authoritative over whatever the caller's `peers`/`joining` args
-        // happen to be (typically routing.conf, which is only a bootstrap
-        // seed good for the very first run - it's never updated after a
-        // membership change).
+        // authoritative over whatever the caller's `peers`/`own_address`/
+        // `joining` args happen to be (typically routing.conf, which is
+        // only a bootstrap seed good for the very first run - it's never
+        // updated after a membership change, and doesn't even list a node
+        // added later via add-server at all).
         peers_ = membership_state_.base_peers();
         self_is_member_ = membership_state_.self_is_member();
+        own_address_ = membership_state_.own_address();
         joining_ = false;
     } else {
         // First-ever run: seed membership_state_ from the constructor's
         // args and persist immediately, so a crash right after this
         // doesn't lose the seed.
         self_is_member_ = !joining_;
-        membership_state_.Set(peers_, self_is_member_);
+        membership_state_.Set(peers_, self_is_member_, own_address_);
     }
 
     // commit_index_/last_applied_ default to 0 and are never persisted
@@ -129,6 +131,8 @@ std::string RaftNode::HandleMessage(const std::string& request_body) {
             return EncodeInstallSnapshotResponse(HandleInstallSnapshot(DecodeInstallSnapshotRequest(request_body)));
         case MessageType::kReadRequest:
             return EncodeReadResponse(HandleReadRequest(DecodeReadRequest(request_body)));
+        case MessageType::kDescribeClusterRequest:
+            return EncodeDescribeClusterResponse(HandleDescribeCluster(DecodeDescribeClusterRequest(request_body)));
         default:
             throw std::runtime_error("unexpected message type received");
     }
@@ -224,7 +228,7 @@ void RaftNode::ApplyCommitted() {
                 }
             }
         }
-        if (membership_changed) membership_state_.Set(std::move(new_base), new_base_self_member);
+        if (membership_changed) membership_state_.Set(std::move(new_base), new_base_self_member, own_address_);
 
         log_.CompactTo(last_applied_, log_.TermAt(last_applied_));
         // Prune up to the *previous* boundary, not the new one: the
@@ -731,8 +735,16 @@ InstallSnapshotResponse RaftNode::HandleInstallSnapshot(const InstallSnapshotReq
         // exactly like `data` itself.
         bool self_member = req.membership.count(id_) > 0;
         std::map<NodeId, PeerAddress> stripped = req.membership;
+        auto self_it = stripped.find(id_);
+        // The leader's dump is self-inclusive (see SendInstallSnapshot), so
+        // if it still considers this node a member, its entry is this
+        // node's own address as the rest of the cluster knows it - more
+        // trustworthy than whatever this run's own_address_ currently
+        // holds (which may just be the raft_main.cpp placeholder for a
+        // beyond-first-run node - see the constructor's own comment).
+        if (self_it != stripped.end()) own_address_ = self_it->second;
         stripped.erase(id_);
-        membership_state_.Set(std::move(stripped), self_member);
+        membership_state_.Set(std::move(stripped), self_member, own_address_);
         RefreshMembership();
 
         commit_cv_.notify_all();
@@ -750,6 +762,14 @@ ReadResponse RaftNode::HandleReadRequest(const ReadRequest& req) {
     } catch (const std::exception& e) {
         return {true, e.what()};
     }
+}
+
+DescribeClusterResponse RaftNode::HandleDescribeCluster(const DescribeClusterRequest&) {
+    // No leader check, like HandleReadRequest - any node can answer from
+    // its own current peers_, no consensus needed. Lets a client discover
+    // the rest of the cluster starting from just this one node's address.
+    std::lock_guard<std::mutex> lock(mutex_);
+    return {id_, own_address_, peers_};
 }
 
 bool RaftNode::Propose(const std::string& command, LogIndex* out_index, int timeout_ms, std::string* out_apply_error) {

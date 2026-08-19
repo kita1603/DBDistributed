@@ -14,6 +14,10 @@ launch.vs.json
 # VS Code debug config - also has a machine-specific absolute gdb path
 .vscode/
 
+# ImGui's own runtime layout cache, written next to wherever raftui.exe
+# happens to be run from - not project source
+imgui.ini
+
 # Local scratch state from manual raftnode testing (raft log, kv data)
 node1/
 node2/

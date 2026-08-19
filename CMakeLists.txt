@@ -71,3 +71,21 @@ target_include_directories(distdb_txn PUBLIC src)
 
 add_executable(raftnode src/raft_main.cpp)
 target_link_libraries(raftnode PRIVATE distdb_raft distdb_storage distdb_sql distdb_shard distdb_txn)
+
+# Dear ImGui desktop client (see README.md's "raftui" section) - Win32 +
+# DirectX11 backend, both inherently Windows-only, unlike every other
+# target in this project. Vendored source under third_party/imgui/ (see
+# third_party/imgui/VENDORED.md) rather than a submodule/FetchContent.
+if(WIN32)
+    add_executable(raftui WIN32
+        src/ui/main.cpp
+        third_party/imgui/imgui.cpp
+        third_party/imgui/imgui_draw.cpp
+        third_party/imgui/imgui_tables.cpp
+        third_party/imgui/imgui_widgets.cpp
+        third_party/imgui/backends/imgui_impl_win32.cpp
+        third_party/imgui/backends/imgui_impl_dx11.cpp
+    )
+    target_include_directories(raftui PRIVATE third_party/imgui third_party/imgui/backends)
+    target_link_libraries(raftui PRIVATE distdb_raft distdb_sql d3d11 dxgi d3dcompiler dwmapi)
+endif()

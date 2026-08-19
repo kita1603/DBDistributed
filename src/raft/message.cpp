@@ -289,4 +289,48 @@ ReadResponse DecodeReadResponse(const std::string& body) {
     return resp;
 }
 
+std::string EncodeDescribeClusterRequest(const DescribeClusterRequest&) {
+    std::string out;
+    AppendU8(out, static_cast<uint8_t>(MessageType::kDescribeClusterRequest));
+    return out;
+}
+
+DescribeClusterRequest DecodeDescribeClusterRequest(const std::string& body) {
+    Reader r(body);
+    r.ReadU8();
+    return {};
+}
+
+std::string EncodeDescribeClusterResponse(const DescribeClusterResponse& resp) {
+    std::string out;
+    AppendU8(out, static_cast<uint8_t>(MessageType::kDescribeClusterResponse));
+    AppendU32(out, resp.id);
+    AppendString(out, resp.own_address.host);
+    AppendU16(out, resp.own_address.port);
+    AppendU32(out, static_cast<uint32_t>(resp.peers.size()));
+    for (const auto& [id, addr] : resp.peers) {
+        AppendU32(out, id);
+        AppendString(out, addr.host);
+        AppendU16(out, addr.port);
+    }
+    return out;
+}
+
+DescribeClusterResponse DecodeDescribeClusterResponse(const std::string& body) {
+    Reader r(body);
+    r.ReadU8();
+    DescribeClusterResponse resp;
+    resp.id = r.ReadU32();
+    resp.own_address.host = r.ReadString();
+    resp.own_address.port = r.ReadU16();
+    uint32_t count = r.ReadU32();
+    for (uint32_t i = 0; i < count; i++) {
+        NodeId id = r.ReadU32();
+        std::string host = r.ReadString();
+        uint16_t port = r.ReadU16();
+        resp.peers[id] = {host, port};
+    }
+    return resp;
+}
+
 }  // namespace distdb

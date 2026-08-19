@@ -529,6 +529,67 @@ silently wrong (it surfaces as a clear "unknown node id" error from
 `SendClientRequest`), but fixing it for real means replicating routing state
 itself, which is dynamic resharding's job, not this increment's.
 
+## `raftui`: a Dear ImGui desktop client (`src/ui/main.cpp`)
+
+`raftnode.exe`'s stdin REPL is fine for development but isn't something
+anyone would actually want to use as a client. `raftui` is a small desktop
+GUI for talking to a running cluster - built with
+[Dear ImGui](https://github.com/ocornut/imgui) on a Win32 + DirectX11
+backend rather than Qt/wxWidgets/MFC specifically because that combination
+needs **no separate SDK or installer**: ImGui is vendored source
+(`third_party/imgui/`, see `third_party/imgui/VENDORED.md` for the exact
+version) compiled with the same MinGW toolchain as everything else in this
+project, and Win32/DirectX11 are already part of Windows. The trade-off is
+that `raftui` is **Windows-only** (guarded by `if(WIN32)` in
+`CMakeLists.txt`) - unlike the rest of this project, which is
+cross-platform (`config/routing.conf`'s own macOS+Windows split). That's an
+acceptable trade for a client tool, since it isn't a cluster node itself.
+
+**Scope (v1)**: a graphical single-shard REPL, not a front-end for every
+REPL feature. It links directly against `distdb_raft`/`distdb_sql` (same
+CMake project, same compiler - no ABI-mismatch risk the way linking a
+separately-built Qt package would have) and calls the exact same
+`SendClientRequest`/`SendReadRequest` (`src/raft/client.h`) the REPL itself
+uses for talking to a single shard, plus the same SQL parser
+(`distdb::Tokenize`/`Parser::ParseStatement`) to decide read vs. write the
+same way `raft_main.cpp` does. **Not** in scope: `CREATE TABLE`
+broadcast-to-every-shard, cross-shard scatter/gather, or 2PC transactions -
+those are orchestration logic that only exists inside `raft_main.cpp`'s
+`main()` today, not reusable library calls; and no live status (role/term/
+leader) panel, since the network protocol (`message.h`) has no remote
+status query today, only `ClientRequest`/`ReadRequest`. Sending a statement
+also blocks the UI thread until the response (or timeout) arrives - matches
+the REPL's own synchronous nature, a known simplification rather than a
+redesign.
+
+**Cluster discovery**: a real DB client only ever needs one address to
+connect - `raftui` originally required typing out every peer's
+`id=host:port` by hand, since `SendClientRequest`'s leader-redirect
+following needs the full peer map upfront to resolve a `leader_hint` id
+into an address. Rather than push that burden onto the user, `raftui` can
+now bootstrap the full map from a single seed address: the "Seed node"
+field takes one `host:port`, and clicking "Discover" sends it a new
+`DescribeClusterRequest`/`DescribeClusterResponse` RPC (`message.h`,
+handled by `RaftNode::HandleDescribeCluster`) that returns that node's own
+id/address plus everything it currently knows about the rest of its
+shard's membership (`peers_`) - the client-side helper
+(`distdb::DiscoverCluster`, `src/raft/client.h`) folds the two into one map
+and fills the "Peers" field with it, ready to edit further or use as-is.
+Like any other membership info, this reflects that one node's view at the
+moment it's asked - if it's stale or lagging (e.g. asked mid-membership
+change), a plain `RoutingTable`/peer-map edit is still the fallback, same
+as before this feature existed.
+
+**Running it**: build normally (`cmake --build build` produces
+`raftui.exe` alongside `raftnode.exe`), start a cluster (e.g. via
+`local_test/` as described above), launch `raftui.exe`, and either type
+one node's `host:port` into "Seed node" and click "Discover" to
+auto-fill "Peers", or enter that shard's peers directly in the "Peers"
+field using the same `id=host:port,id=host:port` syntax as
+`routing.conf`. Then type SQL/REPL statements into the command box and
+press Enter or click Send - responses (or errors) accumulate in the
+output panel above it, exactly like a REPL transcript.
+
 ## Build
 
 Requires a C++17 compiler, CMake >= 3.16, and Ninja.

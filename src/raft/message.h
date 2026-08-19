@@ -107,6 +107,27 @@ struct ReadResponse {
     std::string result;  // the query's result on success, or an error message when `error`
 };
 
+// Lets a client discover a whole cluster's membership starting from just
+// one seed node's address, instead of needing every member's address
+// upfront - a client only has to know how to reach *one* node to build the
+// full peer map SendClientRequest/SendReadRequest need. No consensus
+// involved (like ReadRequest, any node - leader or follower - answers from
+// its own current state, no leader check), so this carries no fields.
+struct DescribeClusterRequest {};
+
+// `id`/`own_address` are the *responding* node's own identity - a client
+// only has a bare network address for its seed node, not which NodeId it
+// is, so this is the only way to learn that. `peers` is everyone else that
+// node currently knows about (its own RaftNode::peers_) - self-exclusive,
+// matching that field's own convention - so the caller combines
+// `{id: own_address}` with `peers` to get the complete membership,
+// including the node it just asked.
+struct DescribeClusterResponse {
+    NodeId id = 0;
+    PeerAddress own_address;
+    std::map<NodeId, PeerAddress> peers;
+};
+
 enum class MessageType : uint8_t {
     kRequestVoteRequest = 1,
     kRequestVoteResponse = 2,
@@ -118,6 +139,8 @@ enum class MessageType : uint8_t {
     kInstallSnapshotResponse = 8,
     kReadRequest = 9,
     kReadResponse = 10,
+    kDescribeClusterRequest = 11,
+    kDescribeClusterResponse = 12,
 };
 
 // Each Encode* function produces a type-tagged binary buffer:
@@ -134,6 +157,8 @@ std::string EncodeInstallSnapshotRequest(const InstallSnapshotRequest& req);
 std::string EncodeInstallSnapshotResponse(const InstallSnapshotResponse& resp);
 std::string EncodeReadRequest(const ReadRequest& req);
 std::string EncodeReadResponse(const ReadResponse& resp);
+std::string EncodeDescribeClusterRequest(const DescribeClusterRequest& req);
+std::string EncodeDescribeClusterResponse(const DescribeClusterResponse& resp);
 
 // Throws std::runtime_error if `body` is too short for its declared
 // fields (a corrupt or truncated message).
@@ -148,5 +173,7 @@ InstallSnapshotRequest DecodeInstallSnapshotRequest(const std::string& body);
 InstallSnapshotResponse DecodeInstallSnapshotResponse(const std::string& body);
 ReadRequest DecodeReadRequest(const std::string& body);
 ReadResponse DecodeReadResponse(const std::string& body);
+DescribeClusterRequest DecodeDescribeClusterRequest(const std::string& body);
+DescribeClusterResponse DecodeDescribeClusterResponse(const std::string& body);
 
 }  // namespace distdb

@@ -171,6 +171,7 @@ class RaftNode {
     ClientResponse HandleClientRequest(const ClientRequest& req);
     InstallSnapshotResponse HandleInstallSnapshot(const InstallSnapshotRequest& req);
     ReadResponse HandleReadRequest(const ReadRequest& req);
+    DescribeClusterResponse HandleDescribeCluster(const DescribeClusterRequest& req);
 
     void TickerLoop();
     void StartElection();

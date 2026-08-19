@@ -66,4 +66,14 @@ std::string SendReadRequest(const std::map<NodeId, PeerAddress>& cluster_peers, 
     throw std::runtime_error("could not reach any node in this cluster: " + last_error);
 }
 
+std::map<NodeId, PeerAddress> DiscoverCluster(const std::string& host, uint16_t port, int timeout_ms) {
+    std::string encoded = EncodeDescribeClusterRequest({});
+    std::string response = RaftTransport::SendRequest(host, port, encoded, timeout_ms);  // throws on failure
+
+    DescribeClusterResponse resp = DecodeDescribeClusterResponse(response);
+    std::map<NodeId, PeerAddress> peers = resp.peers;
+    peers[resp.id] = resp.own_address;  // the seed node itself, self-excluded from its own peers_
+    return peers;
+}
+
 }  // namespace distdb

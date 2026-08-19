@@ -27,4 +27,14 @@ ClientResponse SendClientRequest(const std::map<NodeId, PeerAddress>& cluster_pe
 std::string SendReadRequest(const std::map<NodeId, PeerAddress>& cluster_peers, const std::string& query,
                              int timeout_ms);
 
+// Queries a single node directly - just its bare network address, not a
+// whole `cluster_peers` map - for its own id/address plus everything it
+// currently knows about the rest of the cluster (see
+// RaftNode::HandleDescribeCluster), and returns the combined membership
+// (including that node itself) ready to hand to SendClientRequest/
+// SendReadRequest. Lets a client bootstrap a full peer map from just one
+// seed node's address instead of needing every member's address upfront.
+// Throws std::runtime_error if the node is unreachable.
+std::map<NodeId, PeerAddress> DiscoverCluster(const std::string& host, uint16_t port, int timeout_ms);
+
 }  // namespace distdb

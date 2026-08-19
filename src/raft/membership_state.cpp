@@ -65,11 +65,19 @@ void MembershipState::Load() {
     file.ignore();  // the newline left after `>>`
     std::getline(file, spec);
     base_peers_ = ParsePeerSpec(spec);
+
+    std::string own_spec;
+    std::getline(file, own_spec);
+    size_t colon = own_spec.find(':');
+    if (colon != std::string::npos) {
+        own_address_ = {own_spec.substr(0, colon), static_cast<uint16_t>(std::stoul(own_spec.substr(colon + 1)))};
+    }
 }
 
-void MembershipState::Set(std::map<NodeId, PeerAddress> peers, bool self_is_member) {
+void MembershipState::Set(std::map<NodeId, PeerAddress> peers, bool self_is_member, PeerAddress own_address) {
     base_peers_ = std::move(peers);
     self_is_member_ = self_is_member;
+    own_address_ = std::move(own_address);
     has_file_ = true;
 
     // Write to a temp file and rename over the real one - the same
@@ -77,7 +85,9 @@ void MembershipState::Set(std::map<NodeId, PeerAddress> peers, bool self_is_memb
     std::string tmp_path = path_ + ".tmp";
     {
         std::ofstream file(tmp_path, std::ios::trunc);
-        file << (self_is_member_ ? 1 : 0) << "\n" << FormatPeerSpec(base_peers_) << "\n";
+        file << (self_is_member_ ? 1 : 0) << "\n"
+             << FormatPeerSpec(base_peers_) << "\n"
+             << own_address_.host << ":" << own_address_.port << "\n";
     }
     std::filesystem::rename(tmp_path, path_);
 }
