@@ -16,11 +16,11 @@ struct TableSchema {
     int ColumnIndex(const std::string& name) const;  // -1 if not found
     int PrimaryKeyIndex() const;                     // -1 if none (shouldn't happen for a valid schema)
 
-    // Column names are plain identifiers (no ':' or ',' by construction,
-    // since the parser only accepts identifier characters), so a simple
-    // delimited text format is safe here. Row *values* need real
-    // length-prefixed binary encoding instead, since they can hold
-    // arbitrary bytes - see EncodeRow/DecodeRow in executor.cpp.
+    // Column names/type/PK-ness are plain identifiers, but a column's
+    // default_value (see ColumnDef) is an arbitrary literal - same
+    // arbitrary-bytes concern EncodeRow/DecodeRow (executor.cpp) exists
+    // for - so this uses the same length-prefixed binary encoding rather
+    // than a delimited text format.
     std::string Serialize() const;
     static TableSchema Deserialize(const std::string& blob);
 };

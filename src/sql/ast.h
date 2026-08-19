@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -16,11 +17,28 @@ struct ColumnDef {
     std::string name;
     ColumnType type;
     bool primary_key = false;
+    // Only ever set for a column added later via ALTER TABLE ADD COLUMN -
+    // a column declared in the original CREATE TABLE is never missing from
+    // a row (INSERT must specify every column that existed at insert time),
+    // so it never needs one. Mandatory for ALTER TABLE specifically because
+    // this project has no NULL concept (see InsertStatement's own comment)
+    // - an existing row that predates the column has to read back as
+    // *something*, and a default is the only value that can mean.
+    std::optional<std::string> default_value;
 };
 
 struct CreateTableStatement {
     std::string table_name;
     std::vector<ColumnDef> columns;
+};
+
+// Schema-only change, broadcast to every shard the same way CreateTable is
+// (see raft_main.cpp) - existing rows aren't rewritten; SqlExecutor pads
+// them with `column.default_value` lazily, the first time each is read
+// after the ALTER, rather than rewriting the whole table up front.
+struct AlterTableAddColumnStatement {
+    std::string table_name;
+    ColumnDef column;
 };
 
 // INSERT always specifies every column by name (no NULLs, no partial
@@ -65,6 +83,6 @@ struct DeleteStatement {
 };
 
 using Statement = std::variant<CreateTableStatement, InsertStatement, SelectStatement, UpdateStatement,
-                                DeleteStatement>;
+                                DeleteStatement, AlterTableAddColumnStatement>;
 
 }  // namespace distdb

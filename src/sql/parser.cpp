@@ -59,11 +59,19 @@ std::string Parser::ExpectLiteral() {
 
 Statement Parser::ParseStatement() {
     if (CheckKeyword("CREATE")) return ParseCreateTable();
+    if (CheckKeyword("ALTER")) return ParseAlterTable();
     if (CheckKeyword("INSERT")) return ParseInsert();
     if (CheckKeyword("SELECT")) return ParseSelect();
     if (CheckKeyword("UPDATE")) return ParseUpdate();
     if (CheckKeyword("DELETE")) return ParseDelete();
     throw std::runtime_error("unrecognized statement starting with '" + Peek().text + "'");
+}
+
+ColumnType Parser::ParseColumnType() {
+    std::string type_name = ToUpper(ExpectIdentifier());
+    if (type_name == "TEXT") return ColumnType::kText;
+    if (type_name == "INT") return ColumnType::kInt;
+    throw std::runtime_error("unknown column type '" + type_name + "' (expected TEXT or INT)");
 }
 
 CreateTableStatement Parser::ParseCreateTable() {
@@ -78,14 +86,7 @@ CreateTableStatement Parser::ParseCreateTable() {
     while (true) {
         ColumnDef col;
         col.name = ExpectIdentifier();
-        std::string type_name = ToUpper(ExpectIdentifier());
-        if (type_name == "TEXT") {
-            col.type = ColumnType::kText;
-        } else if (type_name == "INT") {
-            col.type = ColumnType::kInt;
-        } else {
-            throw std::runtime_error("unknown column type '" + type_name + "' (expected TEXT or INT)");
-        }
+        col.type = ParseColumnType();
 
         if (CheckKeyword("PRIMARY")) {
             Advance();
@@ -108,6 +109,31 @@ CreateTableStatement Parser::ParseCreateTable() {
     if (!has_pk) {
         throw std::runtime_error("table '" + stmt.table_name + "' must declare exactly one PRIMARY KEY column");
     }
+    if (CheckSymbol(";")) Advance();
+    return stmt;
+}
+
+AlterTableAddColumnStatement Parser::ParseAlterTable() {
+    ExpectKeyword("ALTER");
+    ExpectKeyword("TABLE");
+
+    AlterTableAddColumnStatement stmt;
+    stmt.table_name = ExpectIdentifier();
+    ExpectKeyword("ADD");
+    if (CheckKeyword("COLUMN")) Advance();  // COLUMN is optional, same as real SQL dialects
+
+    stmt.column.name = ExpectIdentifier();
+    stmt.column.type = ParseColumnType();
+
+    // No NULLs in this project (see InsertStatement's comment) and no row
+    // rewrite happens here (see SqlExecutor::ExecuteAlterTableAddColumn) -
+    // DEFAULT is what every pre-existing row reads back as for this column,
+    // so unlike real SQL it isn't optional. Type-checked by the executor,
+    // same as every other literal the parser hands off (e.g. INSERT/UPDATE
+    // values) - the parser itself never validates literal contents.
+    ExpectKeyword("DEFAULT");
+    stmt.column.default_value = ExpectLiteral();
+
     if (CheckSymbol(";")) Advance();
     return stmt;
 }

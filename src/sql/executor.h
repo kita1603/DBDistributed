@@ -19,6 +19,12 @@ namespace distdb {
 // There is no secondary indexing: SELECT/UPDATE/DELETE without a filter
 // on the primary key still scan every row under a table's prefix via
 // StorageEngine::Scan.
+//
+// ALTER TABLE ADD COLUMN only ever touches the schema entry, never
+// existing rows - a row written before the column existed is shorter than
+// the current schema, and is padded out with the new column's mandatory
+// DEFAULT the moment it's next read (see PadRow in executor.cpp), not
+// rewritten up front.
 class SqlExecutor {
  public:
     explicit SqlExecutor(StorageEngine& engine);
@@ -44,6 +50,7 @@ class SqlExecutor {
 
  private:
     std::string ExecuteCreateTable(const CreateTableStatement& stmt);
+    std::string ExecuteAlterTableAddColumn(const AlterTableAddColumnStatement& stmt);
     std::string ExecuteInsert(const InsertStatement& stmt);
     std::string ExecuteSelect(const SelectStatement& stmt);
     std::string ExecuteUpdate(const UpdateStatement& stmt);

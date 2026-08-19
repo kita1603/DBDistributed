@@ -1,9 +1,36 @@
 #include "schema.h"
 
-#include <sstream>
+#include <cstdint>
+#include <cstring>
 #include <stdexcept>
 
 namespace distdb {
+
+namespace {
+
+void AppendString(std::string& out, const std::string& s) {
+    uint32_t len = static_cast<uint32_t>(s.size());
+    out.append(reinterpret_cast<const char*>(&len), sizeof(len));
+    out.append(s);
+}
+
+std::string ReadString(const std::string& blob, size_t& pos) {
+    uint32_t len = 0;
+    if (pos + sizeof(len) > blob.size()) throw std::runtime_error("corrupt table schema");
+    std::memcpy(&len, blob.data() + pos, sizeof(len));
+    pos += sizeof(len);
+    if (pos + len > blob.size()) throw std::runtime_error("corrupt table schema");
+    std::string s = blob.substr(pos, len);
+    pos += len;
+    return s;
+}
+
+uint8_t ReadByte(const std::string& blob, size_t& pos) {
+    if (pos + 1 > blob.size()) throw std::runtime_error("corrupt table schema");
+    return static_cast<uint8_t>(blob[pos++]);
+}
+
+}  // namespace
 
 int TableSchema::ColumnIndex(const std::string& name) const {
     for (size_t i = 0; i < columns.size(); i++) {
@@ -20,35 +47,37 @@ int TableSchema::PrimaryKeyIndex() const {
 }
 
 std::string TableSchema::Serialize() const {
-    std::ostringstream oss;
-    for (size_t i = 0; i < columns.size(); i++) {
-        if (i > 0) oss << ',';
-        oss << columns[i].name << ':' << (columns[i].type == ColumnType::kInt ? "INT" : "TEXT");
-        if (columns[i].primary_key) oss << ":PK";
+    std::string out;
+    uint32_t count = static_cast<uint32_t>(columns.size());
+    out.append(reinterpret_cast<const char*>(&count), sizeof(count));
+    for (const auto& col : columns) {
+        AppendString(out, col.name);
+        out.push_back(col.type == ColumnType::kInt ? 1 : 0);
+        out.push_back(col.primary_key ? 1 : 0);
+        out.push_back(col.default_value.has_value() ? 1 : 0);
+        if (col.default_value) AppendString(out, *col.default_value);
     }
-    return oss.str();
+    return out;
 }
 
 TableSchema TableSchema::Deserialize(const std::string& blob) {
-    TableSchema schema;
-    std::istringstream stream(blob);
-    std::string field;
-    while (std::getline(stream, field, ',')) {
-        std::istringstream field_stream(field);
-        std::string name;
-        std::string type_str;
-        std::string pk_marker;
-        std::getline(field_stream, name, ':');
-        std::getline(field_stream, type_str, ':');
-        bool is_pk = static_cast<bool>(std::getline(field_stream, pk_marker, ':'));
+    size_t pos = 0;
+    if (pos + sizeof(uint32_t) > blob.size()) throw std::runtime_error("corrupt table schema");
+    uint32_t count = 0;
+    std::memcpy(&count, blob.data() + pos, sizeof(count));
+    pos += sizeof(count);
 
+    TableSchema schema;
+    schema.columns.reserve(count);
+    for (uint32_t i = 0; i < count; i++) {
         ColumnDef col;
-        col.name = name;
-        col.type = (type_str == "INT") ? ColumnType::kInt : ColumnType::kText;
-        col.primary_key = is_pk;
-        schema.columns.push_back(col);
+        col.name = ReadString(blob, pos);
+        col.type = ReadByte(blob, pos) ? ColumnType::kInt : ColumnType::kText;
+        col.primary_key = ReadByte(blob, pos) != 0;
+        if (ReadByte(blob, pos)) col.default_value = ReadString(blob, pos);
+        schema.columns.push_back(std::move(col));
     }
-    if (schema.columns.empty()) throw std::runtime_error("corrupt table schema: " + blob);
+    if (schema.columns.empty()) throw std::runtime_error("corrupt table schema: empty column list");
     return schema;
 }
 

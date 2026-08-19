@@ -35,12 +35,16 @@ just a straight AST-walking executor:
 - `lexer.*` — tokenizes SQL text (identifiers/keywords, numbers, quoted
   strings, symbols).
 - `ast.h` — statement and expression types (`std::variant<CreateTableStatement,
-  InsertStatement, SelectStatement, UpdateStatement, DeleteStatement>`).
-- `parser.*` — recursive-descent parser for `CREATE TABLE`, `INSERT`,
-  `SELECT`, `UPDATE`, `DELETE`. `WHERE` is limited to an AND-chain of
-  `column <op> literal` comparisons — no `OR`, no subqueries, no `JOIN`.
+  InsertStatement, SelectStatement, UpdateStatement, DeleteStatement,
+  AlterTableAddColumnStatement>`).
+- `parser.*` — recursive-descent parser for `CREATE TABLE`,
+  `ALTER TABLE ... ADD COLUMN`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`.
+  `WHERE` is limited to an AND-chain of `column <op> literal` comparisons —
+  no `OR`, no subqueries, no `JOIN`.
 - `schema.*` — a table's column list, persisted at key `__schema__/<table>`
-  via the storage engine, so schemas survive restarts the same way rows do.
+  via the storage engine (length-prefixed binary encoding, since a column's
+  `DEFAULT` literal can hold arbitrary bytes the way column names can't), so
+  schemas survive restarts the same way rows do.
 - `executor.*` — executes a parsed statement: rows are stored at key
   `__row__/<table>/<primary-key-value>`, encoded as length-prefixed fields
   (`EncodeRow`/`DecodeRow`) since column values can hold arbitrary bytes
@@ -54,6 +58,24 @@ Supported column types are `TEXT` and `INT` only; every table needs exactly
 one `PRIMARY KEY` column; `INSERT` must specify every column (no `NULL`s,
 no partial rows); updating the primary key column is rejected (it would
 require moving the row to a new key, not just rewriting it in place).
+
+`ALTER TABLE <table> ADD COLUMN <name> <type> DEFAULT <literal>` adds a
+column without touching existing rows up front - `DEFAULT` is mandatory
+(there's no `NULL` in this project, so a pre-existing row has to read back
+as *something* for a column it predates) rather than optional the way real
+SQL's is. A row shorter than the current schema (i.e. written before the
+`ALTER`) gets padded with each missing column's `DEFAULT` the moment it's
+next read - `SqlExecutor`'s `PadRow` - rather than the whole table being
+rewritten eagerly. This is deliberately closer to how MySQL 8.0/PostgreSQL
+11+ implement `ADD COLUMN ... DEFAULT` (an O(1) metadata change) than to
+older engines that rewrite the whole table synchronously - fits this
+project even better, since eager rewrite would mean replicating a rewrite
+of every row through Raft instead of one schema-only log entry. A row that
+does get written again for any other reason (e.g. an `UPDATE`) is
+persisted at its now-current, fully-padded length, same as any row created
+after the `ALTER` - the padding is only ever a *read-time* fallback for
+whatever's still on disk in its pre-`ALTER` shape, not a permanent
+distinction between "old" and "new" rows.
 
 ### Raft layer (`src/raft/`) — Phase 2: election, heartbeats, and real log replication
 
@@ -246,10 +268,11 @@ so both limits scale with the number of shards instead of staying fixed.
   returns the exact row key it touches if that's determinable without a
   full table scan: an `INSERT` (the primary key value is right there in the
   statement) or a `SELECT`/`UPDATE`/`DELETE` whose `WHERE` pins the primary
-  key with `=`. Returns nothing for `CREATE TABLE` (it's schema, not a row -
-  see below) or a `WHERE` that doesn't pin the primary key (a full table
-  scan, e.g. no filter or one on a non-key column) - `raft_main.cpp` must
-  then decide what to do without a single shard to route to.
+  key with `=`. Returns nothing for `CREATE TABLE`/`ALTER TABLE` (it's
+  schema, not a row - see below) or a `WHERE` that doesn't pin the primary
+  key (a full table scan, e.g. no filter or one on a non-key column) -
+  `raft_main.cpp` must then decide what to do without a single shard to
+  route to.
 - `raft/client.h/.cpp` - `SendClientRequest`/`SendReadRequest`: standalone
   helpers that reach a Raft cluster the calling process *isn't* a member of
   (a different shard), given only its peer addresses from the routing
@@ -264,11 +287,11 @@ so both limits scale with the number of shards instead of staying fixed.
 - `raft_main.cpp` dispatch: `raftnode <node-id> <shard-id> <port>
   <routing-table-path> [state-dir]` - a node's peers now come from the
   routing table (`Shard(shard_id).peers`, minus itself) instead of a
-  separate CLI argument. `CREATE TABLE` is DDL, not row data - any shard
-  could end up holding rows for that table, so it's proposed to *every*
-  shard via a loop (locally through `ProposeOrForward` for this node's own
-  shard, `SendClientRequest` for the rest), not routed to just one.
-  Everything else calls `TryExtractRowKey` first: if it returns a key,
+  separate CLI argument. `CREATE TABLE`/`ALTER TABLE` are DDL, not row data -
+  any shard could end up holding rows for that table, so each is proposed
+  to *every* shard via a loop (locally through `ProposeOrForward` for this
+  node's own shard, `SendClientRequest` for the rest), not routed to just
+  one. Everything else calls `TryExtractRowKey` first: if it returns a key,
   `RoutingTable::ShardFor` picks the one shard responsible, and the
   statement goes through the same local/remote split (`ProposeOrForward`
   or `SendClientRequest` for writes; a direct local `Execute` or
@@ -552,9 +575,9 @@ separately-built Qt package would have) and calls the exact same
 `SendClientRequest`/`SendReadRequest` (`src/raft/client.h`) the REPL itself
 uses for talking to a single shard, plus the same SQL parser
 (`distdb::Tokenize`/`Parser::ParseStatement`) to decide read vs. write the
-same way `raft_main.cpp` does. **Not** in scope: `CREATE TABLE`
-broadcast-to-every-shard, cross-shard scatter/gather, or 2PC transactions -
-those are orchestration logic that only exists inside `raft_main.cpp`'s
+same way `raft_main.cpp` does. **Not** in scope: `CREATE TABLE`/
+`ALTER TABLE` broadcast-to-every-shard, cross-shard scatter/gather, or 2PC
+transactions - those are orchestration logic that only exists inside `raft_main.cpp`'s
 `main()` today, not reusable library calls; and no live status (role/term/
 leader) panel, since the network protocol (`message.h`) has no remote
 status query today, only `ClientRequest`/`ReadRequest`. Sending a statement

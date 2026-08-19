@@ -1,6 +1,8 @@
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -89,6 +91,25 @@ const char* RoleName(distdb::Role role) {
     return "?";
 }
 
+// Prints how long one dispatched SQL statement took, the moment its scope
+// ends - covers every dispatch branch below (CREATE/ALTER TABLE broadcast,
+// scatter/gather, single-shard local/remote) uniformly, including their
+// several early `continue`s, without a separate print call duplicated at
+// each one: declaring one of these right after a statement parses
+// successfully is enough, the same way a std::lock_guard releases no
+// matter which return/continue/exception unwinds its scope.
+class StatementTimer {
+ public:
+    StatementTimer() : start_(std::chrono::steady_clock::now()) {}
+    ~StatementTimer() {
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start_).count();
+        std::cout << "(" << std::fixed << std::setprecision(2) << ms << "ms)\n";
+    }
+
+ private:
+    std::chrono::steady_clock::time_point start_;
+};
+
 void PrintClientResponse(const distdb::ClientResponse& resp) {
     if (resp.success) {
         std::cout << "OK (committed at index " << resp.index << ", via leader node " << resp.leader_hint << ")\n";
@@ -106,18 +127,19 @@ void PrintClientResponse(const distdb::ClientResponse& resp) {
 }
 
 void PrintHelp() {
-    std::cout << "Enter SQL statements (CREATE TABLE / INSERT / SELECT / UPDATE / DELETE).\n"
-                 "CREATE TABLE is broadcast to every shard. INSERT, and any SELECT/UPDATE/\n"
-                 "DELETE whose WHERE pins the primary key with '=', is routed to the one\n"
-                 "shard that owns it (replicated through Raft the same as a single-shard\n"
-                 "cluster, forwarding over the network first if that shard isn't this node's).\n"
-                 "Anything else (no WHERE <pk> = ...) is scattered to every shard and the\n"
-                 "results/counts gathered back into one answer.\n"
+    std::cout << "Enter SQL statements (CREATE TABLE / ALTER TABLE ADD COLUMN / INSERT /\n"
+                 "SELECT / UPDATE / DELETE). CREATE TABLE and ALTER TABLE are broadcast to\n"
+                 "every shard. INSERT, and any SELECT/UPDATE/DELETE whose WHERE pins the\n"
+                 "primary key with '=', is routed to the one shard that owns it (replicated\n"
+                 "through Raft the same as a single-shard cluster, forwarding over the\n"
+                 "network first if that shard isn't this node's). Anything else (no WHERE\n"
+                 "<pk> = ...) is scattered to every shard and the results/counts gathered\n"
+                 "back into one answer.\n"
                  "\n"
                  "  begin              start a transaction: buffers writes instead of running\n"
                  "                     them, until commit/rollback. Only INSERT/UPDATE/DELETE\n"
                  "                     whose WHERE pins the primary key are allowed inside one\n"
-                 "                     (no CREATE TABLE, no SELECT, no whole-table scatter).\n"
+                 "                     (no CREATE/ALTER TABLE, no SELECT, no whole-table scatter).\n"
                  "  commit             two-phase commit every buffered statement, atomically\n"
                  "                     across however many shards they touch\n"
                  "  rollback           discard the buffer - nothing was ever sent anywhere\n"
@@ -584,17 +606,19 @@ int main(int argc, char** argv) {
                 std::cout << "ERROR: " << e.what() << "\n";
                 continue;
             }
+            StatementTimer timer;  // prints elapsed time once this statement's dispatch below finishes
 
             if (in_txn) {
                 // Deliberately narrow: only a statement that pins one
                 // row's primary key can be staged as one participant
-                // shard's share of a PREPARE. CREATE TABLE is schema, not
-                // a row, and a whole-table SELECT/UPDATE/DELETE has no
-                // single shard to lock it against - see the scatter/gather
-                // path above for those, which already has no cross-shard
-                // atomicity story of its own to begin with.
-                if (std::holds_alternative<distdb::CreateTableStatement>(parsed)) {
-                    std::cout << "ERROR: CREATE TABLE is not supported inside a transaction\n";
+                // shard's share of a PREPARE. CREATE TABLE/ALTER TABLE are
+                // schema, not a row, and a whole-table SELECT/UPDATE/DELETE
+                // has no single shard to lock it against - see the
+                // scatter/gather path above for those, which already has no
+                // cross-shard atomicity story of its own to begin with.
+                if (std::holds_alternative<distdb::CreateTableStatement>(parsed) ||
+                    std::holds_alternative<distdb::AlterTableAddColumnStatement>(parsed)) {
+                    std::cout << "ERROR: CREATE TABLE/ALTER TABLE are not supported inside a transaction\n";
                     continue;
                 }
                 if (std::holds_alternative<distdb::SelectStatement>(parsed)) {
@@ -625,6 +649,13 @@ int main(int argc, char** argv) {
                 // identical copy of it, not just the one (if any) that
                 // would own some specific key.
                 PrintBroadcastResult(BroadcastWrite(routing, node, shard_id, line, kCrossShardTimeoutMs), "created");
+                continue;
+            }
+            if (std::holds_alternative<distdb::AlterTableAddColumnStatement>(parsed)) {
+                // Same reasoning as CREATE TABLE above - every shard's copy
+                // of this table's schema needs the new column, since a row
+                // for this table could exist on any of them.
+                PrintBroadcastResult(BroadcastWrite(routing, node, shard_id, line, kCrossShardTimeoutMs), "altered");
                 continue;
             }
 

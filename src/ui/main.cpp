@@ -16,6 +16,7 @@
 #include <d3d11.h>
 #include <windows.h>
 
+#include <chrono>
 #include <map>
 #include <sstream>
 #include <string>
@@ -204,12 +205,22 @@ std::string FormatClientResponse(const distdb::ClientResponse& resp) {
     return out;
 }
 
+enum class ResultKind { kText, kTable, kError };
+
+struct StatementResult {
+    ResultKind kind = ResultKind::kText;
+    std::string text;
+};
+
 // Sends one statement to the cluster: parses it to decide read vs. write
 // (mirroring raft_main.cpp's own dispatch), then calls the same client
 // library functions the REPL itself uses. Blocking - see main.cpp's top
-// comment/README for why that's an accepted v1 simplification.
-std::string SendStatement(const std::map<distdb::NodeId, distdb::PeerAddress>& peers, const std::string& line) {
-    if (peers.empty()) return "ERROR: no peers configured - enter a peer list first";
+// comment/README for why that's an accepted v1 simplification. The
+// resulting `kind` tells the render loop whether `text` is grid-worthy
+// (SqlExecutor::ExecuteSelect's tab-separated header+rows format) rather
+// than having it re-sniff the statement/response itself.
+StatementResult SendStatement(const std::map<distdb::NodeId, distdb::PeerAddress>& peers, const std::string& line) {
+    if (peers.empty()) return {ResultKind::kError, "ERROR: no peers configured - enter a peer list first"};
 
     bool is_select = false;
     try {
@@ -217,15 +228,15 @@ std::string SendStatement(const std::map<distdb::NodeId, distdb::PeerAddress>& p
         distdb::Statement parsed = parser.ParseStatement();
         is_select = std::holds_alternative<distdb::SelectStatement>(parsed);
     } catch (const std::exception& e) {
-        return std::string("ERROR: ") + e.what();
+        return {ResultKind::kError, std::string("ERROR: ") + e.what()};
     }
 
     constexpr int kTimeoutMs = 3000;
     if (is_select) {
         try {
-            return distdb::SendReadRequest(peers, line, kTimeoutMs);
+            return {ResultKind::kTable, distdb::SendReadRequest(peers, line, kTimeoutMs)};
         } catch (const std::exception& e) {
-            return std::string("ERROR: ") + e.what();
+            return {ResultKind::kError, std::string("ERROR: ") + e.what()};
         }
     }
     // SendClientRequest already catches network-level failures internally
@@ -239,10 +250,68 @@ std::string SendStatement(const std::map<distdb::NodeId, distdb::PeerAddress>& p
     // the top of the call stack, which terminates the whole process
     // instead of just failing this one send.
     try {
-        return FormatClientResponse(distdb::SendClientRequest(peers, line, kTimeoutMs));
+        distdb::ClientResponse resp = distdb::SendClientRequest(peers, line, kTimeoutMs);
+        return {resp.success ? ResultKind::kText : ResultKind::kError, FormatClientResponse(resp)};
     } catch (const std::exception& e) {
-        return std::string("ERROR: ") + e.what();
+        return {ResultKind::kError, std::string("ERROR: ") + e.what()};
     }
+}
+
+// Parses SqlExecutor::ExecuteSelect's own output format (a tab-separated
+// header line, then one tab-separated line per matching row, or a literal
+// "(0 rows)" line when none matched) into a grid the render loop can hand
+// to ImGui's table API. Returns false (leaving `headers`/`rows` untouched)
+// if `text` doesn't even have a header line - the render loop falls back
+// to plain text in that case rather than showing an empty table.
+bool TryParseSelectTable(const std::string& text, std::vector<std::string>& headers,
+                          std::vector<std::vector<std::string>>& rows) {
+    std::istringstream stream(text);
+    std::string header_line;
+    if (!std::getline(stream, header_line) || header_line.empty()) return false;
+
+    std::vector<std::string> parsed_headers;
+    std::istringstream header_stream(header_line);
+    std::string col;
+    while (std::getline(header_stream, col, '\t')) parsed_headers.push_back(col);
+    if (parsed_headers.empty()) return false;
+
+    std::vector<std::vector<std::string>> parsed_rows;
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (line == "(0 rows)") continue;  // trailing marker, not a data row
+        std::vector<std::string> row;
+        std::istringstream line_stream(line);
+        std::string val;
+        while (std::getline(line_stream, val, '\t')) row.push_back(val);
+        parsed_rows.push_back(std::move(row));
+    }
+
+    headers = std::move(parsed_headers);
+    rows = std::move(parsed_rows);
+    return true;
+}
+
+// One entry in the output history panel - either a plain line (command
+// echo, OK/FAILED/ERROR text) or a parsed SELECT result rendered as a
+// bordered grid (see TryParseSelectTable).
+struct HistoryEntry {
+    ResultKind kind = ResultKind::kText;
+    std::string text;
+    std::vector<std::string> headers;
+    std::vector<std::vector<std::string>> rows;
+    // Only set for an actual SendStatement result (not the "> <command>"
+    // echo, and not the Discover button's own messages) - see the render
+    // loop, which only prints an elapsed-time line when this is true.
+    bool has_timing = false;
+    double elapsed_ms = 0.0;
+};
+
+HistoryEntry MakeHistoryEntry(ResultKind kind, std::string text) {
+    HistoryEntry entry;
+    bool parsed_as_table = kind == ResultKind::kTable && TryParseSelectTable(text, entry.headers, entry.rows);
+    entry.kind = parsed_as_table ? ResultKind::kTable : (kind == ResultKind::kTable ? ResultKind::kText : kind);
+    entry.text = std::move(text);
+    return entry;
 }
 
 }  // namespace
@@ -276,7 +345,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     char seed_buf[128] = "127.0.0.1:9001";
     char peers_buf[256] = "1=127.0.0.1:9001,2=127.0.0.1:9002";
     char command_buf[512] = "";
-    std::vector<std::string> history;
+    std::vector<HistoryEntry> history;
     bool scroll_to_bottom = false;
 
     bool done = false;
@@ -313,17 +382,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             std::string host;
             uint16_t port = 0;
             if (!ParseHostPort(seed_buf, host, port)) {
-                history.push_back("ERROR: seed must be host:port");
+                history.push_back(MakeHistoryEntry(ResultKind::kError, "ERROR: seed must be host:port"));
             } else {
                 try {
                     auto discovered = distdb::DiscoverCluster(host, port, 3000);
                     std::string formatted = FormatPeerSpec(discovered);
                     size_t n = formatted.copy(peers_buf, sizeof(peers_buf) - 1);
                     peers_buf[n] = '\0';
-                    history.push_back("Discovered " + std::to_string(discovered.size()) + " peer(s) from " +
-                                       std::string(seed_buf) + ": " + formatted);
+                    history.push_back(MakeHistoryEntry(ResultKind::kText,
+                                                        "Discovered " + std::to_string(discovered.size()) +
+                                                            " peer(s) from " + std::string(seed_buf) + ": " +
+                                                            formatted));
                 } catch (const std::exception& e) {
-                    history.push_back(std::string("ERROR: ") + e.what());
+                    history.push_back(MakeHistoryEntry(ResultKind::kError, std::string("ERROR: ") + e.what()));
                 }
                 scroll_to_bottom = true;
             }
@@ -340,8 +411,33 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
         ImGui::TextUnformatted("Output:");
         ImGui::BeginChild("output", ImVec2(0, -60), ImGuiChildFlags_Borders);
-        for (const auto& line : history) {
-            ImGui::TextWrapped("%s", line.c_str());
+        for (size_t i = 0; i < history.size(); i++) {
+            const HistoryEntry& entry = history[i];
+            if (entry.kind == ResultKind::kTable) {
+                std::string table_id = "##table" + std::to_string(i);
+                ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                        ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp;
+                if (ImGui::BeginTable(table_id.c_str(), static_cast<int>(entry.headers.size()), flags)) {
+                    for (const auto& header : entry.headers) ImGui::TableSetupColumn(header.c_str());
+                    ImGui::TableHeadersRow();
+                    for (const auto& row : entry.rows) {
+                        ImGui::TableNextRow();
+                        for (const auto& cell : row) {
+                            ImGui::TableNextColumn();
+                            ImGui::TextUnformatted(cell.c_str());
+                        }
+                    }
+                    ImGui::EndTable();
+                }
+                if (entry.rows.empty()) ImGui::TextDisabled("(0 rows)");
+            } else if (entry.kind == ResultKind::kError) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.45f, 0.45f, 1.0f));
+                ImGui::TextWrapped("%s", entry.text.c_str());
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::TextWrapped("%s", entry.text.c_str());
+            }
+            if (entry.has_timing) ImGui::TextDisabled("(%.2fms)", entry.elapsed_ms);
         }
         if (scroll_to_bottom) {
             ImGui::SetScrollHereY(1.0f);
@@ -357,8 +453,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
         if (send && command_buf[0] != '\0') {
             std::string line = command_buf;
-            history.push_back("> " + line);
-            history.push_back(SendStatement(peers, line));
+            history.push_back(MakeHistoryEntry(ResultKind::kText, "> " + line));
+
+            auto stmt_start = std::chrono::steady_clock::now();
+            StatementResult result = SendStatement(peers, line);
+            double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                            stmt_start)
+                                     .count();
+
+            HistoryEntry entry = MakeHistoryEntry(result.kind, std::move(result.text));
+            entry.has_timing = true;
+            entry.elapsed_ms = elapsed_ms;
+            history.push_back(std::move(entry));
+
             command_buf[0] = '\0';
             scroll_to_bottom = true;
         }

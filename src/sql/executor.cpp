@@ -52,6 +52,17 @@ std::vector<std::string> DecodeRow(const std::string& blob) {
     return values;
 }
 
+// A row shorter than `schema.columns` predates one or more ALTER TABLE ADD
+// COLUMN calls - pad it out with each missing column's DEFAULT (mandatory
+// for exactly this reason, see ColumnDef's comment) so every other
+// function can keep indexing `row[idx]` by the *current* schema without
+// caring which rows are old and which are new.
+void PadRow(const TableSchema& schema, std::vector<std::string>& row) {
+    while (row.size() < schema.columns.size()) {
+        row.push_back(*schema.columns[row.size()].default_value);
+    }
+}
+
 // Finds an equality condition on `schema`'s primary key column within
 // `where`, if any - shared by TryExtractRowKey's SELECT/UPDATE/DELETE
 // cases below.
@@ -137,6 +148,8 @@ std::string SqlExecutor::Execute(const std::string& sql) {
             using T = std::decay_t<decltype(s)>;
             if constexpr (std::is_same_v<T, CreateTableStatement>) {
                 return ExecuteCreateTable(s);
+            } else if constexpr (std::is_same_v<T, AlterTableAddColumnStatement>) {
+                return ExecuteAlterTableAddColumn(s);
             } else if constexpr (std::is_same_v<T, InsertStatement>) {
                 return ExecuteInsert(s);
             } else if constexpr (std::is_same_v<T, SelectStatement>) {
@@ -170,7 +183,8 @@ std::optional<std::string> SqlExecutor::TryExtractRowKey(const Statement& stmt) 
                     if (pk) return RowKey(s.table_name, *pk);
                     return std::nullopt;  // no WHERE <pk> = ... - touches the whole table
                 } else {
-                    return std::nullopt;  // CreateTableStatement - no single row, needs every shard
+                    return std::nullopt;  // CreateTableStatement/AlterTableAddColumnStatement - schema, not a
+                                           // row, needs every shard
                 }
             } catch (...) {
                 // e.g. the table doesn't exist - let the normal
@@ -188,6 +202,23 @@ std::string SqlExecutor::ExecuteCreateTable(const CreateTableStatement& stmt) {
     }
     TableSchema schema;
     schema.columns = stmt.columns;
+    engine_.Put(SchemaKey(stmt.table_name), schema.Serialize());
+    return "OK";
+}
+
+std::string SqlExecutor::ExecuteAlterTableAddColumn(const AlterTableAddColumnStatement& stmt) {
+    TableSchema schema = LoadSchema(stmt.table_name);
+
+    if (schema.ColumnIndex(stmt.column.name) >= 0) {
+        throw std::runtime_error("column already exists: " + stmt.column.name);
+    }
+    // The parser requires DEFAULT, so this should always hold - but the
+    // executor is the layer that actually enforces literal validity (same
+    // division as INSERT/UPDATE's ValidateIntLiteral calls), not the parser.
+    if (!stmt.column.default_value) throw std::runtime_error("ALTER TABLE ADD COLUMN requires a DEFAULT value");
+    if (stmt.column.type == ColumnType::kInt) ValidateIntLiteral(stmt.column.name, *stmt.column.default_value);
+
+    schema.columns.push_back(stmt.column);
     engine_.Put(SchemaKey(stmt.table_name), schema.Serialize());
     return "OK";
 }
@@ -247,6 +278,7 @@ std::string SqlExecutor::ExecuteSelect(const SelectStatement& stmt) {
     size_t match_count = 0;
     for (const auto& [key, blob] : engine_.Scan(RowPrefix(stmt.table_name))) {
         std::vector<std::string> row = DecodeRow(blob);
+        PadRow(schema, row);
         if (!MatchesWhere(schema, row, stmt.where)) continue;
         match_count++;
         out << '\n';
@@ -275,6 +307,7 @@ std::string SqlExecutor::ExecuteUpdate(const UpdateStatement& stmt) {
     size_t updated = 0;
     for (const auto& [key, blob] : engine_.Scan(RowPrefix(stmt.table_name))) {
         std::vector<std::string> row = DecodeRow(blob);
+        PadRow(schema, row);
         if (!MatchesWhere(schema, row, stmt.where)) continue;
         for (const auto& [idx, literal] : assignments) row[idx] = literal;
         engine_.Put(key, EncodeRow(row));
@@ -289,6 +322,7 @@ std::string SqlExecutor::ExecuteDelete(const DeleteStatement& stmt) {
     size_t deleted = 0;
     for (const auto& [key, blob] : engine_.Scan(RowPrefix(stmt.table_name))) {
         std::vector<std::string> row = DecodeRow(blob);
+        PadRow(schema, row);
         if (!MatchesWhere(schema, row, stmt.where)) continue;
         engine_.Delete(key);
         deleted++;
