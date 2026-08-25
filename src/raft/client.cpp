@@ -15,12 +15,27 @@ namespace {
 constexpr int kMaxHops = 4;
 
 // How many *consecutive* RPC failures against one (host, port) trip its
-// circuit, and how long it then stays tripped before being tried again -
-// small numbers, same convention as this project's other thresholds
-// (kMemtableFlushThreshold, kCompactionThreshold), chosen so the effect is
-// easy to observe by hand rather than tuned for a real workload.
-constexpr int kFailureThreshold = 2;
-constexpr auto kCooldown = std::chrono::milliseconds(3000);
+// circuit, and how long it then stays tripped before being tried again.
+// This is a purely client-side, purely query-speed concern - unlike
+// RaftNode::Propose()'s own peer-response tracking (node.cpp), tripping
+// the breaker never touches actual Raft membership/quorum, and a node
+// that comes back doesn't need re-adding via add-server the way one
+// that's really been remove-server'd would. kFailureThreshold=5 is
+// deliberately a bit conservative (higher than this project's other
+// small, easy-to-trigger thresholds like kMemtableFlushThreshold) so a
+// couple of one-off blips - a slow response, a transient network hiccup -
+// don't trip it; only a peer that's *consistently* unreachable does.
+// kCooldown started at 3s but that turned out too short for how this
+// client actually gets used: a person testing by hand naturally leaves
+// more than 3s between queries (reading the last result, typing the
+// next one), so the tripped peer kept un-tripping itself right before
+// every next attempt, undoing the whole point of the breaker - found by
+// hand against a real 3-node cluster with one machine asleep. 30s is
+// long enough to survive a normal back-and-forth testing pace while
+// still recovering well within a single sitting once the dead peer is
+// actually back.
+constexpr int kFailureThreshold = 5;
+constexpr auto kCooldown = std::chrono::milliseconds(30000);
 
 // Per-process, per-endpoint memory of "did the last few RPCs to this
 // address fail" - shared by SendClientRequest and SendReadRequest below so
