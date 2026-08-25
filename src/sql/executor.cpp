@@ -156,6 +156,8 @@ std::string SqlExecutor::Execute(const std::string& sql) {
                 return ExecuteSelect(s);
             } else if constexpr (std::is_same_v<T, UpdateStatement>) {
                 return ExecuteUpdate(s);
+            } else if constexpr (std::is_same_v<T, ShowTablesStatement>) {
+                return ExecuteShowTables(s);
             } else {
                 return ExecuteDelete(s);
             }
@@ -184,7 +186,8 @@ std::optional<std::string> SqlExecutor::TryExtractRowKey(const Statement& stmt) 
                     return std::nullopt;  // no WHERE <pk> = ... - touches the whole table
                 } else {
                     return std::nullopt;  // CreateTableStatement/AlterTableAddColumnStatement - schema, not a
-                                           // row, needs every shard
+                                           // row, needs every shard; ShowTablesStatement - a read, but not
+                                           // pinned to any single row either
                 }
             } catch (...) {
                 // e.g. the table doesn't exist - let the normal
@@ -328,6 +331,21 @@ std::string SqlExecutor::ExecuteDelete(const DeleteStatement& stmt) {
         deleted++;
     }
     return std::to_string(deleted) + " row(s) deleted";
+}
+
+std::string SqlExecutor::ExecuteShowTables(const ShowTablesStatement&) {
+    static const std::string kSchemaPrefix = "__schema__/";
+
+    std::ostringstream out;
+    out << "table";
+    size_t count = 0;
+    for (const auto& [key, blob] : engine_.Scan(kSchemaPrefix)) {
+        (void)blob;
+        out << '\n' << key.substr(kSchemaPrefix.size());
+        count++;
+    }
+    if (count == 0) out << "\n(0 rows)";
+    return out.str();
 }
 
 }  // namespace distdb

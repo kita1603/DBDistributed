@@ -128,13 +128,14 @@ void PrintClientResponse(const distdb::ClientResponse& resp) {
 
 void PrintHelp() {
     std::cout << "Enter SQL statements (CREATE TABLE / ALTER TABLE ADD COLUMN / INSERT /\n"
-                 "SELECT / UPDATE / DELETE). CREATE TABLE and ALTER TABLE are broadcast to\n"
-                 "every shard. INSERT, and any SELECT/UPDATE/DELETE whose WHERE pins the\n"
-                 "primary key with '=', is routed to the one shard that owns it (replicated\n"
-                 "through Raft the same as a single-shard cluster, forwarding over the\n"
-                 "network first if that shard isn't this node's). Anything else (no WHERE\n"
-                 "<pk> = ...) is scattered to every shard and the results/counts gathered\n"
-                 "back into one answer.\n"
+                 "SELECT / UPDATE / DELETE / SHOW TABLES). CREATE TABLE and ALTER TABLE are\n"
+                 "broadcast to every shard. INSERT, and any SELECT/UPDATE/DELETE whose WHERE\n"
+                 "pins the primary key with '=', is routed to the one shard that owns it\n"
+                 "(replicated through Raft the same as a single-shard cluster, forwarding\n"
+                 "over the network first if that shard isn't this node's). Anything else (no\n"
+                 "WHERE <pk> = ...) is scattered to every shard and the results/counts\n"
+                 "gathered back into one answer. SHOW TABLES only ever asks this node's own\n"
+                 "shard - every shard's schema copy is already identical.\n"
                  "\n"
                  "  begin              start a transaction: buffers writes instead of running\n"
                  "                     them, until commit/rollback. Only INSERT/UPDATE/DELETE\n"
@@ -621,10 +622,11 @@ int main(int argc, char** argv) {
                     std::cout << "ERROR: CREATE TABLE/ALTER TABLE are not supported inside a transaction\n";
                     continue;
                 }
-                if (std::holds_alternative<distdb::SelectStatement>(parsed)) {
-                    std::cout << "ERROR: SELECT is not supported inside a transaction (writes are staged, not "
-                                 "applied, until commit - a read here could never see them anyway); run it before "
-                                 "begin or after commit/rollback\n";
+                if (std::holds_alternative<distdb::SelectStatement>(parsed) ||
+                    std::holds_alternative<distdb::ShowTablesStatement>(parsed)) {
+                    std::cout << "ERROR: SELECT/SHOW TABLES are not supported inside a transaction (writes are "
+                                 "staged, not applied, until commit - a read here could never see them anyway); "
+                                 "run it before begin or after commit/rollback\n";
                     continue;
                 }
                 auto key = sql.TryExtractRowKey(parsed);
@@ -656,6 +658,22 @@ int main(int argc, char** argv) {
                 // of this table's schema needs the new column, since a row
                 // for this table could exist on any of them.
                 PrintBroadcastResult(BroadcastWrite(routing, node, shard_id, line, kCrossShardTimeoutMs), "altered");
+                continue;
+            }
+            if (std::holds_alternative<distdb::ShowTablesStatement>(parsed)) {
+                // The opposite of CREATE/ALTER TABLE above: a read, and
+                // every shard already has an identical copy of every
+                // table's schema (that's exactly what broadcasting CREATE/
+                // ALTER TABLE guarantees), so this node's own shard alone
+                // already has the complete, correct answer - no need to
+                // scatter to every shard and merge like a row-data SELECT
+                // with no WHERE would need.
+                try {
+                    std::lock_guard<std::mutex> lock(engine_mutex);
+                    std::cout << sql.Execute(line) << "\n";
+                } catch (const std::exception& e) {
+                    std::cout << "ERROR: " << e.what() << "\n";
+                }
                 continue;
             }
 

@@ -64,6 +64,7 @@ Statement Parser::ParseStatement() {
     if (CheckKeyword("SELECT")) return ParseSelect();
     if (CheckKeyword("UPDATE")) return ParseUpdate();
     if (CheckKeyword("DELETE")) return ParseDelete();
+    if (CheckKeyword("SHOW")) return ParseShowTables();
     throw std::runtime_error("unrecognized statement starting with '" + Peek().text + "'");
 }
 
@@ -246,6 +247,13 @@ DeleteStatement Parser::ParseDelete() {
 
     if (CheckSymbol(";")) Advance();
     return stmt;
+}
+
+ShowTablesStatement Parser::ParseShowTables() {
+    ExpectKeyword("SHOW");
+    ExpectKeyword("TABLES");
+    if (CheckSymbol(";")) Advance();
+    return {};
 }
 
 CompareOp Parser::ParseCompareOp() {

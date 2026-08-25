@@ -40,8 +40,9 @@ class SqlExecutor {
     // SELECT/UPDATE/DELETE whose WHERE pins the primary key with an
     // equality condition - returns that row's storage key
     // ("__row__/<table>/<pk-value>"). Returns nullopt for anything else
-    // (CREATE TABLE, or a WHERE clause that doesn't pin the primary key,
-    // e.g. a full table scan or a filter on a non-key column) - the
+    // (CREATE/ALTER TABLE, SHOW TABLES, or a WHERE clause that doesn't pin
+    // the primary key, e.g. a full table scan or a filter on a non-key
+    // column) - the
     // caller must then treat the statement as touching the whole table
     // rather than routing it to a single shard. Used by the sharding
     // layer (raft_main.cpp), which has no other way to know which shard
@@ -55,6 +56,7 @@ class SqlExecutor {
     std::string ExecuteSelect(const SelectStatement& stmt);
     std::string ExecuteUpdate(const UpdateStatement& stmt);
     std::string ExecuteDelete(const DeleteStatement& stmt);
+    std::string ExecuteShowTables(const ShowTablesStatement& stmt);
 
     TableSchema LoadSchema(const std::string& table_name) const;
     static std::string SchemaKey(const std::string& table_name);

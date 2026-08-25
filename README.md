@@ -36,11 +36,11 @@ just a straight AST-walking executor:
   strings, symbols).
 - `ast.h` — statement and expression types (`std::variant<CreateTableStatement,
   InsertStatement, SelectStatement, UpdateStatement, DeleteStatement,
-  AlterTableAddColumnStatement>`).
+  AlterTableAddColumnStatement, ShowTablesStatement>`).
 - `parser.*` — recursive-descent parser for `CREATE TABLE`,
-  `ALTER TABLE ... ADD COLUMN`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`.
-  `WHERE` is limited to an AND-chain of `column <op> literal` comparisons —
-  no `OR`, no subqueries, no `JOIN`.
+  `ALTER TABLE ... ADD COLUMN`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`,
+  `SHOW TABLES`. `WHERE` is limited to an AND-chain of `column <op> literal`
+  comparisons — no `OR`, no subqueries, no `JOIN`.
 - `schema.*` — a table's column list, persisted at key `__schema__/<table>`
   via the storage engine (length-prefixed binary encoding, since a column's
   `DEFAULT` literal can hold arbitrary bytes the way column names can't), so
@@ -76,6 +76,19 @@ persisted at its now-current, fully-padded length, same as any row created
 after the `ALTER` - the padding is only ever a *read-time* fallback for
 whatever's still on disk in its pre-`ALTER` shape, not a permanent
 distinction between "old" and "new" rows.
+
+`SHOW TABLES` lists every table's name - unlike a row-data `SELECT` with no
+`WHERE` (which needs every shard scattered and merged, since shards own
+disjoint *rows*), every shard already holds an identical copy of every
+table's *schema* (that's exactly what broadcasting `CREATE`/`ALTER TABLE`
+to every shard guarantees), so asking this node's own shard alone is
+already the complete, correct answer - no scatter/gather needed. Routed
+and executed exactly like a `SELECT` otherwise (a read, not a Raft
+proposal): `raft_main.cpp` answers it locally without forwarding, and
+`raftui` sends it via `SendReadRequest` to whichever peer answers first,
+rendering the result as the same bordered table a `SELECT` gets (its
+output is a `SELECT`-shaped one-column table, header `table` then one row
+per table name).
 
 ### Raft layer (`src/raft/`) — Phase 2: election, heartbeats, and real log replication
 
@@ -611,7 +624,9 @@ auto-fill "Peers", or enter that shard's peers directly in the "Peers"
 field using the same `id=host:port,id=host:port` syntax as
 `routing.conf`. Then type SQL/REPL statements into the command box and
 press Enter or click Send - responses (or errors) accumulate in the
-output panel above it, exactly like a REPL transcript.
+output panel above it, exactly like a REPL transcript. The "Tables"
+button next to Send is a shortcut for typing `SHOW TABLES` yourself -
+same result, same rendering, just one click.
 
 ## Build
 

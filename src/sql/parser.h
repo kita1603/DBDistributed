@@ -9,10 +9,10 @@
 namespace distdb {
 
 // Recursive-descent parser for a small SQL subset: CREATE TABLE, ALTER
-// TABLE ADD COLUMN, INSERT, SELECT, UPDATE, DELETE. WHERE is limited to an
-// AND-chain of `column <op> literal` comparisons - no OR, no parentheses in
-// expressions, no subqueries, no JOINs. Throws std::runtime_error with a
-// human-readable message on any syntax error.
+// TABLE ADD COLUMN, INSERT, SELECT, UPDATE, DELETE, SHOW TABLES. WHERE is
+// limited to an AND-chain of `column <op> literal` comparisons - no OR, no
+// parentheses in expressions, no subqueries, no JOINs. Throws
+// std::runtime_error with a human-readable message on any syntax error.
 class Parser {
  public:
     explicit Parser(std::vector<Token> tokens);
@@ -35,6 +35,7 @@ class Parser {
     SelectStatement ParseSelect();
     UpdateStatement ParseUpdate();
     DeleteStatement ParseDelete();
+    ShowTablesStatement ParseShowTables();
     std::vector<Condition> ParseWhereClause();
     CompareOp ParseCompareOp();
     ColumnType ParseColumnType();

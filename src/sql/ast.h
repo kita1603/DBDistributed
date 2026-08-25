@@ -82,7 +82,16 @@ struct DeleteStatement {
     std::vector<Condition> where;  // empty means every row
 };
 
+// Lists every table's name - schema-only, like CreateTableStatement, but a
+// *read*: CREATE/ALTER TABLE already broadcast a table's schema to every
+// shard (see raft_main.cpp), so any single shard's own copy is already the
+// complete, correct answer - no scatter/gather needed the way a row-data
+// SELECT with no WHERE would need. Executed and routed exactly like a
+// SelectStatement (see raft_main.cpp/raftui's is_select checks), just
+// against a fixed, empty query rather than a table's rows.
+struct ShowTablesStatement {};
+
 using Statement = std::variant<CreateTableStatement, InsertStatement, SelectStatement, UpdateStatement,
-                                DeleteStatement, AlterTableAddColumnStatement>;
+                                DeleteStatement, AlterTableAddColumnStatement, ShowTablesStatement>;
 
 }  // namespace distdb

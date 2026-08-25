@@ -222,17 +222,23 @@ struct StatementResult {
 StatementResult SendStatement(const std::map<distdb::NodeId, distdb::PeerAddress>& peers, const std::string& line) {
     if (peers.empty()) return {ResultKind::kError, "ERROR: no peers configured - enter a peer list first"};
 
-    bool is_select = false;
+    // SHOW TABLES is a read exactly like SELECT here too: raftui never
+    // scatters across shards (out of scope, see this file's top comment),
+    // so it just needs *a* reachable peer to answer, same as SELECT -
+    // SendReadRequest already tries every peer in turn regardless of
+    // which shard it belongs to.
+    bool is_read = false;
     try {
         distdb::Parser parser(distdb::Tokenize(line));
         distdb::Statement parsed = parser.ParseStatement();
-        is_select = std::holds_alternative<distdb::SelectStatement>(parsed);
+        is_read = std::holds_alternative<distdb::SelectStatement>(parsed) ||
+                  std::holds_alternative<distdb::ShowTablesStatement>(parsed);
     } catch (const std::exception& e) {
         return {ResultKind::kError, std::string("ERROR: ") + e.what()};
     }
 
     constexpr int kTimeoutMs = 3000;
-    if (is_select) {
+    if (is_read) {
         try {
             return {ResultKind::kTable, distdb::SendReadRequest(peers, line, kTimeoutMs)};
         } catch (const std::exception& e) {
@@ -445,14 +451,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         }
         ImGui::EndChild();
 
-        ImGui::SetNextItemWidth(-100);
-        bool send = ImGui::InputText("##command", command_buf, sizeof(command_buf),
-                                      ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::SameLine();
-        send = ImGui::Button("Send") || send;
-
-        if (send && command_buf[0] != '\0') {
-            std::string line = command_buf;
+        // Shared by the command box's Send and the Tables shortcut button
+        // below - both just run a statement and append the same "> ..."
+        // echo plus timed result to history.
+        auto run_statement = [&](const std::string& line) {
             history.push_back(MakeHistoryEntry(ResultKind::kText, "> " + line));
 
             auto stmt_start = std::chrono::steady_clock::now();
@@ -466,8 +468,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             entry.elapsed_ms = elapsed_ms;
             history.push_back(std::move(entry));
 
-            command_buf[0] = '\0';
             scroll_to_bottom = true;
+        };
+
+        ImGui::SetNextItemWidth(-160);
+        bool send = ImGui::InputText("##command", command_buf, sizeof(command_buf),
+                                      ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        send = ImGui::Button("Send") || send;
+        ImGui::SameLine();
+        if (ImGui::Button("Tables")) run_statement("SHOW TABLES");
+
+        if (send && command_buf[0] != '\0') {
+            run_statement(command_buf);
+            command_buf[0] = '\0';
         }
 
         ImGui::End();
