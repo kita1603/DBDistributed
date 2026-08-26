@@ -16,7 +16,9 @@
 #include <d3d11.h>
 #include <windows.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <map>
 #include <sstream>
 #include <string>
@@ -187,6 +189,68 @@ bool ParseHostPort(const std::string& s, std::string& host, uint16_t& port) {
     }
 }
 
+std::string ToUpperCopy(const std::string& s) {
+    std::string out = s;
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return std::toupper(c); });
+    return out;
+}
+
+// If `db` is non-empty and `line`'s one table reference (right after
+// CREATE/ALTER TABLE, INSERT INTO, SELECT/DELETE/SHOW TABLES ...FROM, or a
+// leading UPDATE) is a bare, unqualified identifier, splices "<db>." in
+// front of it at that token's exact original position - lets the
+// "Database" field save retyping the qualifier on every statement,
+// without guessing at SQL structure itself: this uses the same
+// Tokenize() the real parser does, not a separate ad hoc scan, and only
+// ever touches the one position a real parse would also demand
+// qualification at. Returns `line` unchanged if `db` is empty, `line`
+// doesn't fail to tokenize, doesn't have one of those shapes (e.g.
+// CREATE DATABASE, SHOW DATABASES), or that reference is already
+// qualified - in every such case the line is sent exactly as typed, and
+// if it's wrong, the real parser's own error reports that, not this.
+std::string QualifyIfBare(const std::string& line, const std::string& db) {
+    if (db.empty()) return line;
+    std::vector<distdb::Token> tokens;
+    try {
+        tokens = distdb::Tokenize(line);
+    } catch (const std::exception&) {
+        return line;
+    }
+
+    // SHOW TABLES FROM <database> and SHOW DATABASES both take a bare
+    // database name, never a table reference - the FROM/TABLE keyword
+    // match below would otherwise wrongly qualify SHOW TABLES FROM's
+    // argument as if it were a table.
+    if (!tokens.empty() && tokens[0].type == distdb::TokenType::kIdentifier && ToUpperCopy(tokens[0].text) == "SHOW") {
+        return line;
+    }
+
+    size_t table_token = std::string::npos;
+    if (!tokens.empty() && tokens[0].type == distdb::TokenType::kIdentifier &&
+        ToUpperCopy(tokens[0].text) == "UPDATE") {
+        table_token = 1;
+    } else {
+        for (size_t i = 0; i + 1 < tokens.size(); i++) {
+            if (tokens[i].type != distdb::TokenType::kIdentifier) continue;
+            std::string kw = ToUpperCopy(tokens[i].text);
+            if (kw == "TABLE" || kw == "INTO" || kw == "FROM") {
+                table_token = i + 1;
+                break;
+            }
+        }
+    }
+
+    if (table_token == std::string::npos || table_token >= tokens.size()) return line;
+    const distdb::Token& name = tokens[table_token];
+    if (name.type != distdb::TokenType::kIdentifier) return line;
+    bool already_qualified = table_token + 1 < tokens.size() &&
+                              tokens[table_token + 1].type == distdb::TokenType::kSymbol &&
+                              tokens[table_token + 1].text == ".";
+    if (already_qualified) return line;
+
+    return line.substr(0, name.offset) + db + "." + line.substr(name.offset);
+}
+
 // Adapted from raft_main.cpp's PrintClientResponse - same formatting,
 // returned as a string instead of printed to stdout.
 std::string FormatClientResponse(const distdb::ClientResponse& resp) {
@@ -232,7 +296,8 @@ StatementResult SendStatement(const std::map<distdb::NodeId, distdb::PeerAddress
         distdb::Parser parser(distdb::Tokenize(line));
         distdb::Statement parsed = parser.ParseStatement();
         is_read = std::holds_alternative<distdb::SelectStatement>(parsed) ||
-                  std::holds_alternative<distdb::ShowTablesStatement>(parsed);
+                  std::holds_alternative<distdb::ShowTablesStatement>(parsed) ||
+                  std::holds_alternative<distdb::ShowDatabasesStatement>(parsed);
     } catch (const std::exception& e) {
         return {ResultKind::kError, std::string("ERROR: ") + e.what()};
     }
@@ -350,6 +415,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     std::map<distdb::NodeId, distdb::PeerAddress> peers;
     char seed_buf[128] = "127.0.0.1:9001";
     char peers_buf[256] = "1=127.0.0.1:9001,2=127.0.0.1:9002";
+    // Every table reference in this project's SQL must be written
+    // <database>.<table> - there's no server-side "current database" (see
+    // ast.h's CreateTableStatement comment for why). This field is a
+    // purely client-side convenience for that: it qualifies the "Tables"
+    // button's SHOW TABLES, and QualifyIfBare splices it in front of
+    // whatever bare table name you type in the command box too (see that
+    // function's own comment for exactly what it will and won't touch),
+    // so picking a database once here saves retyping it on every line.
+    char database_buf[128] = "";
+    std::vector<std::string> known_databases;  // populated by SHOW DATABASES - see the "Databases" button below
     char command_buf[512] = "";
     std::vector<HistoryEntry> history;
     bool scroll_to_bottom = false;
@@ -380,6 +455,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                       ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                           ImGuiWindowFlags_NoCollapse);
 
+        // Silent (no history entry) SHOW DATABASES, used to (re)populate
+        // the "Database" dropdown - after a successful Discover below
+        // (the first point in the UI where there's actually a live peer
+        // to ask, so it can't run any earlier than that - e.g. not once
+        // at window startup, since peers_buf's hardcoded default isn't
+        // necessarily a real cluster yet), after clicking the "Databases"
+        // button, and right after a CREATE DATABASE typed into the
+        // command box succeeds - so a database you just created shows up
+        // to pick from immediately, without a second visible round trip
+        // cluttering the transcript.
+        auto refresh_known_databases = [&](const StatementResult& result) {
+            std::vector<std::string> headers;
+            std::vector<std::vector<std::string>> rows;
+            if (result.kind != ResultKind::kTable || !TryParseSelectTable(result.text, headers, rows)) return;
+            known_databases.clear();
+            for (const auto& row : rows) {
+                if (!row.empty()) known_databases.push_back(row[0]);
+            }
+        };
+
         ImGui::TextUnformatted("Seed node (host:port) - only need one, the rest are discovered:");
         ImGui::SetNextItemWidth(-100);
         ImGui::InputText("##seed", seed_buf, sizeof(seed_buf));
@@ -399,6 +494,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                                                         "Discovered " + std::to_string(discovered.size()) +
                                                             " peer(s) from " + std::string(seed_buf) + ": " +
                                                             formatted));
+                    refresh_known_databases(SendStatement(discovered, "SHOW DATABASES"));
                 } catch (const std::exception& e) {
                     history.push_back(MakeHistoryEntry(ResultKind::kError, std::string("ERROR: ") + e.what()));
                 }
@@ -451,10 +547,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         }
         ImGui::EndChild();
 
-        // Shared by the command box's Send and the Tables shortcut button
-        // below - both just run a statement and append the same "> ..."
-        // echo plus timed result to history.
-        auto run_statement = [&](const std::string& line) {
+        // Shared by the command box's Send and the Databases/Tables
+        // shortcut buttons below - all three just run a statement and
+        // append the same "> ..." echo plus timed result to history.
+        // Returns the raw result too (unlike a void helper would), so a
+        // caller than needs more than the printed transcript - the
+        // Databases button parsing out db names for the dropdown below,
+        // Send silently re-checking after a CREATE DATABASE - doesn't
+        // have to re-send the same statement a second time.
+        auto run_statement = [&](const std::string& line) -> StatementResult {
             history.push_back(MakeHistoryEntry(ResultKind::kText, "> " + line));
 
             auto stmt_start = std::chrono::steady_clock::now();
@@ -463,24 +564,65 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                                                                             stmt_start)
                                      .count();
 
-            HistoryEntry entry = MakeHistoryEntry(result.kind, std::move(result.text));
+            HistoryEntry entry = MakeHistoryEntry(result.kind, result.text);
             entry.has_timing = true;
             entry.elapsed_ms = elapsed_ms;
             history.push_back(std::move(entry));
 
             scroll_to_bottom = true;
+            return result;
         };
 
+
+        ImGui::TextUnformatted("Database (auto-qualifies the Tables button and any bare table name you type");
+        ImGui::TextUnformatted("below - the sent statement always shows fully-qualified in the log):");
         ImGui::SetNextItemWidth(-160);
+        const char* preview = database_buf[0] != '\0' ? database_buf : "(select database)";
+        if (ImGui::BeginCombo("##database", preview)) {
+            for (const auto& db : known_databases) {
+                bool is_selected = db == database_buf;
+                if (ImGui::Selectable(db.c_str(), is_selected)) {
+                    size_t n = db.copy(database_buf, sizeof(database_buf) - 1);
+                    database_buf[n] = '\0';
+                }
+                if (is_selected) ImGui::SetItemDefaultFocus();
+            }
+            if (known_databases.empty()) ImGui::TextDisabled("(click Databases first)");
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Databases")) refresh_known_databases(run_statement("SHOW DATABASES"));
+        ImGui::SameLine();
+        if (ImGui::Button("Tables")) {
+            if (database_buf[0] == '\0') {
+                history.push_back(
+                    MakeHistoryEntry(ResultKind::kError, "ERROR: enter a database name above first"));
+                scroll_to_bottom = true;
+            } else {
+                run_statement("SHOW TABLES FROM " + std::string(database_buf));
+            }
+        }
+
+        ImGui::SetNextItemWidth(-100);
         bool send = ImGui::InputText("##command", command_buf, sizeof(command_buf),
                                       ImGuiInputTextFlags_EnterReturnsTrue);
         ImGui::SameLine();
         send = ImGui::Button("Send") || send;
-        ImGui::SameLine();
-        if (ImGui::Button("Tables")) run_statement("SHOW TABLES");
 
         if (send && command_buf[0] != '\0') {
-            run_statement(command_buf);
+            std::string line = QualifyIfBare(command_buf, database_buf);
+            bool was_create_database = false;
+            try {
+                distdb::Parser parser(distdb::Tokenize(line));
+                was_create_database = std::holds_alternative<distdb::CreateDatabaseStatement>(parser.ParseStatement());
+            } catch (const std::exception&) {
+                // Not parseable - run_statement below will report the same
+                // error; no database to refresh either way.
+            }
+            StatementResult result = run_statement(line);
+            if (was_create_database && result.kind != ResultKind::kError) {
+                refresh_known_databases(SendStatement(peers, "SHOW DATABASES"));
+            }
             command_buf[0] = '\0';
         }
 
