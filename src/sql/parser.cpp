@@ -57,15 +57,53 @@ std::string Parser::ExpectLiteral() {
     return Advance().text;
 }
 
+std::pair<std::string, std::string> Parser::ExpectQualifiedTableName() {
+    std::string db_name = ExpectIdentifier();
+    if (!CheckSymbol(".")) {
+        throw std::runtime_error("table name '" + db_name +
+                                  "' must be qualified as <database>.<table> - there is no current/default "
+                                  "database in this project (see CREATE DATABASE)");
+    }
+    Advance();
+    std::string table_name = ExpectIdentifier();
+    return {db_name, table_name};
+}
+
 Statement Parser::ParseStatement() {
-    if (CheckKeyword("CREATE")) return ParseCreateTable();
+    if (CheckKeyword("CREATE")) {
+        // Peek past CREATE to tell DATABASE apart from TABLE - both start
+        // the same way, so ParseStatement is the only place that needs to
+        // know which of the two follows.
+        if (pos_ + 1 < tokens_.size() && tokens_[pos_ + 1].type == TokenType::kIdentifier &&
+            ToUpper(tokens_[pos_ + 1].text) == "DATABASE") {
+            return ParseCreateDatabase();
+        }
+        return ParseCreateTable();
+    }
     if (CheckKeyword("ALTER")) return ParseAlterTable();
     if (CheckKeyword("INSERT")) return ParseInsert();
     if (CheckKeyword("SELECT")) return ParseSelect();
     if (CheckKeyword("UPDATE")) return ParseUpdate();
     if (CheckKeyword("DELETE")) return ParseDelete();
-    if (CheckKeyword("SHOW")) return ParseShowTables();
+    if (CheckKeyword("SHOW")) {
+        // Same peek-ahead reasoning as CREATE above, for TABLES vs DATABASES.
+        if (pos_ + 1 < tokens_.size() && tokens_[pos_ + 1].type == TokenType::kIdentifier &&
+            ToUpper(tokens_[pos_ + 1].text) == "DATABASES") {
+            return ParseShowDatabases();
+        }
+        return ParseShowTables();
+    }
     throw std::runtime_error("unrecognized statement starting with '" + Peek().text + "'");
+}
+
+CreateDatabaseStatement Parser::ParseCreateDatabase() {
+    ExpectKeyword("CREATE");
+    ExpectKeyword("DATABASE");
+
+    CreateDatabaseStatement stmt;
+    stmt.name = ExpectIdentifier();
+    if (CheckSymbol(";")) Advance();
+    return stmt;
 }
 
 ColumnType Parser::ParseColumnType() {
@@ -80,7 +118,9 @@ CreateTableStatement Parser::ParseCreateTable() {
     ExpectKeyword("TABLE");
 
     CreateTableStatement stmt;
-    stmt.table_name = ExpectIdentifier();
+    auto [db_name, table_name] = ExpectQualifiedTableName();
+    stmt.db_name = db_name;
+    stmt.table_name = table_name;
     ExpectSymbol("(");
 
     bool has_pk = false;
@@ -119,7 +159,9 @@ AlterTableAddColumnStatement Parser::ParseAlterTable() {
     ExpectKeyword("TABLE");
 
     AlterTableAddColumnStatement stmt;
-    stmt.table_name = ExpectIdentifier();
+    auto [db_name, table_name] = ExpectQualifiedTableName();
+    stmt.db_name = db_name;
+    stmt.table_name = table_name;
     ExpectKeyword("ADD");
     if (CheckKeyword("COLUMN")) Advance();  // COLUMN is optional, same as real SQL dialects
 
@@ -144,7 +186,9 @@ InsertStatement Parser::ParseInsert() {
     ExpectKeyword("INTO");
 
     InsertStatement stmt;
-    stmt.table_name = ExpectIdentifier();
+    auto [db_name, table_name] = ExpectQualifiedTableName();
+    stmt.db_name = db_name;
+    stmt.table_name = table_name;
 
     ExpectSymbol("(");
     while (true) {
@@ -194,7 +238,9 @@ SelectStatement Parser::ParseSelect() {
     }
 
     ExpectKeyword("FROM");
-    stmt.table_name = ExpectIdentifier();
+    auto [db_name, table_name] = ExpectQualifiedTableName();
+    stmt.db_name = db_name;
+    stmt.table_name = table_name;
 
     if (CheckKeyword("WHERE")) {
         Advance();
@@ -209,7 +255,9 @@ UpdateStatement Parser::ParseUpdate() {
     ExpectKeyword("UPDATE");
 
     UpdateStatement stmt;
-    stmt.table_name = ExpectIdentifier();
+    auto [db_name, table_name] = ExpectQualifiedTableName();
+    stmt.db_name = db_name;
+    stmt.table_name = table_name;
     ExpectKeyword("SET");
 
     while (true) {
@@ -238,7 +286,9 @@ DeleteStatement Parser::ParseDelete() {
     ExpectKeyword("FROM");
 
     DeleteStatement stmt;
-    stmt.table_name = ExpectIdentifier();
+    auto [db_name, table_name] = ExpectQualifiedTableName();
+    stmt.db_name = db_name;
+    stmt.table_name = table_name;
 
     if (CheckKeyword("WHERE")) {
         Advance();
@@ -252,6 +302,17 @@ DeleteStatement Parser::ParseDelete() {
 ShowTablesStatement Parser::ParseShowTables() {
     ExpectKeyword("SHOW");
     ExpectKeyword("TABLES");
+    ExpectKeyword("FROM");
+
+    ShowTablesStatement stmt;
+    stmt.db_name = ExpectIdentifier();
+    if (CheckSymbol(";")) Advance();
+    return stmt;
+}
+
+ShowDatabasesStatement Parser::ParseShowDatabases() {
+    ExpectKeyword("SHOW");
+    ExpectKeyword("DATABASES");
     if (CheckSymbol(";")) Advance();
     return {};
 }

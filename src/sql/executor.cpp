@@ -80,15 +80,25 @@ std::optional<std::string> FindPkEquality(const TableSchema& schema, const std::
 
 SqlExecutor::SqlExecutor(StorageEngine& engine) : engine_(engine) {}
 
-std::string SqlExecutor::SchemaKey(const std::string& table_name) { return "__schema__/" + table_name; }
-std::string SqlExecutor::RowPrefix(const std::string& table_name) { return "__row__/" + table_name + "/"; }
-std::string SqlExecutor::RowKey(const std::string& table_name, const std::string& pk_value) {
-    return RowPrefix(table_name) + pk_value;
+std::string SqlExecutor::DatabaseKey(const std::string& db_name) { return "__database__/" + db_name; }
+std::string SqlExecutor::SchemaKey(const std::string& db_name, const std::string& table_name) {
+    return "__schema__/" + db_name + "/" + table_name;
+}
+std::string SqlExecutor::RowPrefix(const std::string& db_name, const std::string& table_name) {
+    return "__row__/" + db_name + "/" + table_name + "/";
+}
+std::string SqlExecutor::RowKey(const std::string& db_name, const std::string& table_name,
+                                 const std::string& pk_value) {
+    return RowPrefix(db_name, table_name) + pk_value;
 }
 
-TableSchema SqlExecutor::LoadSchema(const std::string& table_name) const {
-    auto blob = engine_.Get(SchemaKey(table_name));
-    if (!blob) throw std::runtime_error("no such table: " + table_name);
+void SqlExecutor::RequireDatabaseExists(const std::string& db_name) const {
+    if (!engine_.Get(DatabaseKey(db_name))) throw std::runtime_error("no such database: " + db_name);
+}
+
+TableSchema SqlExecutor::LoadSchema(const std::string& db_name, const std::string& table_name) const {
+    auto blob = engine_.Get(SchemaKey(db_name, table_name));
+    if (!blob) throw std::runtime_error("no such table: " + db_name + "." + table_name);
     return TableSchema::Deserialize(*blob);
 }
 
@@ -146,7 +156,9 @@ std::string SqlExecutor::Execute(const std::string& sql) {
     return std::visit(
         [this](auto&& s) -> std::string {
             using T = std::decay_t<decltype(s)>;
-            if constexpr (std::is_same_v<T, CreateTableStatement>) {
+            if constexpr (std::is_same_v<T, CreateDatabaseStatement>) {
+                return ExecuteCreateDatabase(s);
+            } else if constexpr (std::is_same_v<T, CreateTableStatement>) {
                 return ExecuteCreateTable(s);
             } else if constexpr (std::is_same_v<T, AlterTableAddColumnStatement>) {
                 return ExecuteAlterTableAddColumn(s);
@@ -158,6 +170,8 @@ std::string SqlExecutor::Execute(const std::string& sql) {
                 return ExecuteUpdate(s);
             } else if constexpr (std::is_same_v<T, ShowTablesStatement>) {
                 return ExecuteShowTables(s);
+            } else if constexpr (std::is_same_v<T, ShowDatabasesStatement>) {
+                return ExecuteShowDatabases(s);
             } else {
                 return ExecuteDelete(s);
             }
@@ -171,23 +185,24 @@ std::optional<std::string> SqlExecutor::TryExtractRowKey(const Statement& stmt) 
             using T = std::decay_t<decltype(s)>;
             try {
                 if constexpr (std::is_same_v<T, InsertStatement>) {
-                    TableSchema schema = LoadSchema(s.table_name);
+                    TableSchema schema = LoadSchema(s.db_name, s.table_name);
                     int pk_idx = schema.PrimaryKeyIndex();
                     const std::string& pk_name = schema.columns[pk_idx].name;
                     for (size_t i = 0; i < s.columns.size(); i++) {
-                        if (s.columns[i] == pk_name) return RowKey(s.table_name, s.values[i]);
+                        if (s.columns[i] == pk_name) return RowKey(s.db_name, s.table_name, s.values[i]);
                     }
                     return std::nullopt;  // INSERT didn't name the pk column - ExecuteInsert will report that
                 } else if constexpr (std::is_same_v<T, SelectStatement> || std::is_same_v<T, UpdateStatement> ||
                                       std::is_same_v<T, DeleteStatement>) {
-                    TableSchema schema = LoadSchema(s.table_name);
+                    TableSchema schema = LoadSchema(s.db_name, s.table_name);
                     auto pk = FindPkEquality(schema, s.where);
-                    if (pk) return RowKey(s.table_name, *pk);
+                    if (pk) return RowKey(s.db_name, s.table_name, *pk);
                     return std::nullopt;  // no WHERE <pk> = ... - touches the whole table
                 } else {
-                    return std::nullopt;  // CreateTableStatement/AlterTableAddColumnStatement - schema, not a
-                                           // row, needs every shard; ShowTablesStatement - a read, but not
-                                           // pinned to any single row either
+                    return std::nullopt;  // CreateDatabaseStatement/CreateTableStatement/
+                                           // AlterTableAddColumnStatement - schema, not a row, needs every
+                                           // shard; ShowTablesStatement/ShowDatabasesStatement - a read, but
+                                           // not pinned to any single row either
                 }
             } catch (...) {
                 // e.g. the table doesn't exist - let the normal
@@ -199,18 +214,32 @@ std::optional<std::string> SqlExecutor::TryExtractRowKey(const Statement& stmt) 
         stmt);
 }
 
+std::string SqlExecutor::ExecuteCreateDatabase(const CreateDatabaseStatement& stmt) {
+    if (engine_.Get(DatabaseKey(stmt.name))) {
+        throw std::runtime_error("database already exists: " + stmt.name);
+    }
+    // The value itself carries no information - existence of the key is
+    // the only thing that matters (RequireDatabaseExists just checks
+    // engine_.Get(...).has_value()) - so an empty string is fine; it's
+    // not a tombstone (see StorageEngine's own doc comment), just a
+    // zero-length live value.
+    engine_.Put(DatabaseKey(stmt.name), "");
+    return "OK";
+}
+
 std::string SqlExecutor::ExecuteCreateTable(const CreateTableStatement& stmt) {
-    if (engine_.Get(SchemaKey(stmt.table_name))) {
-        throw std::runtime_error("table already exists: " + stmt.table_name);
+    RequireDatabaseExists(stmt.db_name);
+    if (engine_.Get(SchemaKey(stmt.db_name, stmt.table_name))) {
+        throw std::runtime_error("table already exists: " + stmt.db_name + "." + stmt.table_name);
     }
     TableSchema schema;
     schema.columns = stmt.columns;
-    engine_.Put(SchemaKey(stmt.table_name), schema.Serialize());
+    engine_.Put(SchemaKey(stmt.db_name, stmt.table_name), schema.Serialize());
     return "OK";
 }
 
 std::string SqlExecutor::ExecuteAlterTableAddColumn(const AlterTableAddColumnStatement& stmt) {
-    TableSchema schema = LoadSchema(stmt.table_name);
+    TableSchema schema = LoadSchema(stmt.db_name, stmt.table_name);
 
     if (schema.ColumnIndex(stmt.column.name) >= 0) {
         throw std::runtime_error("column already exists: " + stmt.column.name);
@@ -222,16 +251,16 @@ std::string SqlExecutor::ExecuteAlterTableAddColumn(const AlterTableAddColumnSta
     if (stmt.column.type == ColumnType::kInt) ValidateIntLiteral(stmt.column.name, *stmt.column.default_value);
 
     schema.columns.push_back(stmt.column);
-    engine_.Put(SchemaKey(stmt.table_name), schema.Serialize());
+    engine_.Put(SchemaKey(stmt.db_name, stmt.table_name), schema.Serialize());
     return "OK";
 }
 
 std::string SqlExecutor::ExecuteInsert(const InsertStatement& stmt) {
-    TableSchema schema = LoadSchema(stmt.table_name);
+    TableSchema schema = LoadSchema(stmt.db_name, stmt.table_name);
 
     if (stmt.columns.size() != schema.columns.size()) {
         throw std::runtime_error("INSERT must specify all " + std::to_string(schema.columns.size()) +
-                                  " column(s) of table '" + stmt.table_name + "'");
+                                  " column(s) of table '" + stmt.db_name + "." + stmt.table_name + "'");
     }
 
     std::vector<std::string> row(schema.columns.size());
@@ -246,7 +275,7 @@ std::string SqlExecutor::ExecuteInsert(const InsertStatement& stmt) {
     }
 
     int pk_idx = schema.PrimaryKeyIndex();
-    std::string key = RowKey(stmt.table_name, row[pk_idx]);
+    std::string key = RowKey(stmt.db_name, stmt.table_name, row[pk_idx]);
     if (engine_.Get(key)) throw std::runtime_error("duplicate primary key: " + row[pk_idx]);
 
     engine_.Put(key, EncodeRow(row));
@@ -254,7 +283,7 @@ std::string SqlExecutor::ExecuteInsert(const InsertStatement& stmt) {
 }
 
 std::string SqlExecutor::ExecuteSelect(const SelectStatement& stmt) {
-    TableSchema schema = LoadSchema(stmt.table_name);
+    TableSchema schema = LoadSchema(stmt.db_name, stmt.table_name);
 
     std::vector<int> projection;
     std::vector<std::string> headers;
@@ -279,7 +308,7 @@ std::string SqlExecutor::ExecuteSelect(const SelectStatement& stmt) {
     }
 
     size_t match_count = 0;
-    for (const auto& [key, blob] : engine_.Scan(RowPrefix(stmt.table_name))) {
+    for (const auto& [key, blob] : engine_.Scan(RowPrefix(stmt.db_name, stmt.table_name))) {
         std::vector<std::string> row = DecodeRow(blob);
         PadRow(schema, row);
         if (!MatchesWhere(schema, row, stmt.where)) continue;
@@ -295,7 +324,7 @@ std::string SqlExecutor::ExecuteSelect(const SelectStatement& stmt) {
 }
 
 std::string SqlExecutor::ExecuteUpdate(const UpdateStatement& stmt) {
-    TableSchema schema = LoadSchema(stmt.table_name);
+    TableSchema schema = LoadSchema(stmt.db_name, stmt.table_name);
 
     int pk_idx = schema.PrimaryKeyIndex();
     std::vector<std::pair<int, std::string>> assignments;
@@ -308,7 +337,7 @@ std::string SqlExecutor::ExecuteUpdate(const UpdateStatement& stmt) {
     }
 
     size_t updated = 0;
-    for (const auto& [key, blob] : engine_.Scan(RowPrefix(stmt.table_name))) {
+    for (const auto& [key, blob] : engine_.Scan(RowPrefix(stmt.db_name, stmt.table_name))) {
         std::vector<std::string> row = DecodeRow(blob);
         PadRow(schema, row);
         if (!MatchesWhere(schema, row, stmt.where)) continue;
@@ -320,10 +349,10 @@ std::string SqlExecutor::ExecuteUpdate(const UpdateStatement& stmt) {
 }
 
 std::string SqlExecutor::ExecuteDelete(const DeleteStatement& stmt) {
-    TableSchema schema = LoadSchema(stmt.table_name);
+    TableSchema schema = LoadSchema(stmt.db_name, stmt.table_name);
 
     size_t deleted = 0;
-    for (const auto& [key, blob] : engine_.Scan(RowPrefix(stmt.table_name))) {
+    for (const auto& [key, blob] : engine_.Scan(RowPrefix(stmt.db_name, stmt.table_name))) {
         std::vector<std::string> row = DecodeRow(blob);
         PadRow(schema, row);
         if (!MatchesWhere(schema, row, stmt.where)) continue;
@@ -333,15 +362,31 @@ std::string SqlExecutor::ExecuteDelete(const DeleteStatement& stmt) {
     return std::to_string(deleted) + " row(s) deleted";
 }
 
-std::string SqlExecutor::ExecuteShowTables(const ShowTablesStatement&) {
-    static const std::string kSchemaPrefix = "__schema__/";
+std::string SqlExecutor::ExecuteShowTables(const ShowTablesStatement& stmt) {
+    RequireDatabaseExists(stmt.db_name);
+    const std::string schema_prefix = "__schema__/" + stmt.db_name + "/";
 
     std::ostringstream out;
     out << "table";
     size_t count = 0;
-    for (const auto& [key, blob] : engine_.Scan(kSchemaPrefix)) {
+    for (const auto& [key, blob] : engine_.Scan(schema_prefix)) {
         (void)blob;
-        out << '\n' << key.substr(kSchemaPrefix.size());
+        out << '\n' << key.substr(schema_prefix.size());
+        count++;
+    }
+    if (count == 0) out << "\n(0 rows)";
+    return out.str();
+}
+
+std::string SqlExecutor::ExecuteShowDatabases(const ShowDatabasesStatement&) {
+    static const std::string kDatabasePrefix = "__database__/";
+
+    std::ostringstream out;
+    out << "database";
+    size_t count = 0;
+    for (const auto& [key, blob] : engine_.Scan(kDatabasePrefix)) {
+        (void)blob;
+        out << '\n' << key.substr(kDatabasePrefix.size());
         count++;
     }
     if (count == 0) out << "\n(0 rows)";

@@ -11,10 +11,11 @@
 namespace distdb {
 
 // Executes parsed SQL statements against a StorageEngine, which only
-// knows about opaque string keys/values - this layer maps SQL tables and
-// rows onto that key space:
-//   "__schema__/<table>"   -> serialized column list (TableSchema)
-//   "__row__/<table>/<pk>" -> serialized column values (EncodeRow)
+// knows about opaque string keys/values - this layer maps SQL databases,
+// tables, and rows onto that key space:
+//   "__database__/<db>"          -> empty marker value (SqlExecutor::ExecuteCreateDatabase)
+//   "__schema__/<db>/<table>"    -> serialized column list (TableSchema)
+//   "__row__/<db>/<table>/<pk>"  -> serialized column values (EncodeRow)
 //
 // There is no secondary indexing: SELECT/UPDATE/DELETE without a filter
 // on the primary key still scan every row under a table's prefix via
@@ -39,17 +40,18 @@ class SqlExecutor {
     // (whose primary key value is right there in the statement) or a
     // SELECT/UPDATE/DELETE whose WHERE pins the primary key with an
     // equality condition - returns that row's storage key
-    // ("__row__/<table>/<pk-value>"). Returns nullopt for anything else
-    // (CREATE/ALTER TABLE, SHOW TABLES, or a WHERE clause that doesn't pin
-    // the primary key, e.g. a full table scan or a filter on a non-key
-    // column) - the
-    // caller must then treat the statement as touching the whole table
-    // rather than routing it to a single shard. Used by the sharding
-    // layer (raft_main.cpp), which has no other way to know which shard
-    // a statement belongs to without duplicating schema knowledge.
+    // ("__row__/<db>/<table>/<pk-value>"). Returns nullopt for anything
+    // else (CREATE DATABASE/TABLE, ALTER TABLE, SHOW TABLES/DATABASES, or
+    // a WHERE clause that doesn't pin the primary key, e.g. a full table
+    // scan or a filter on a non-key column) - the caller must then treat
+    // the statement as touching the whole table rather than routing it to
+    // a single shard. Used by the sharding layer (raft_main.cpp), which
+    // has no other way to know which shard a statement belongs to without
+    // duplicating schema knowledge.
     std::optional<std::string> TryExtractRowKey(const Statement& stmt) const;
 
  private:
+    std::string ExecuteCreateDatabase(const CreateDatabaseStatement& stmt);
     std::string ExecuteCreateTable(const CreateTableStatement& stmt);
     std::string ExecuteAlterTableAddColumn(const AlterTableAddColumnStatement& stmt);
     std::string ExecuteInsert(const InsertStatement& stmt);
@@ -57,11 +59,15 @@ class SqlExecutor {
     std::string ExecuteUpdate(const UpdateStatement& stmt);
     std::string ExecuteDelete(const DeleteStatement& stmt);
     std::string ExecuteShowTables(const ShowTablesStatement& stmt);
+    std::string ExecuteShowDatabases(const ShowDatabasesStatement& stmt);
 
-    TableSchema LoadSchema(const std::string& table_name) const;
-    static std::string SchemaKey(const std::string& table_name);
-    static std::string RowPrefix(const std::string& table_name);
-    static std::string RowKey(const std::string& table_name, const std::string& pk_value);
+    TableSchema LoadSchema(const std::string& db_name, const std::string& table_name) const;
+    void RequireDatabaseExists(const std::string& db_name) const;
+    static std::string DatabaseKey(const std::string& db_name);
+    static std::string SchemaKey(const std::string& db_name, const std::string& table_name);
+    static std::string RowPrefix(const std::string& db_name, const std::string& table_name);
+    static std::string RowKey(const std::string& db_name, const std::string& table_name,
+                               const std::string& pk_value);
 
     static bool MatchesWhere(const TableSchema& schema, const std::vector<std::string>& row,
                               const std::vector<Condition>& where);

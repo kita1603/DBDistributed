@@ -36,30 +36,51 @@ just a straight AST-walking executor:
   strings, symbols).
 - `ast.h` — statement and expression types (`std::variant<CreateTableStatement,
   InsertStatement, SelectStatement, UpdateStatement, DeleteStatement,
-  AlterTableAddColumnStatement, ShowTablesStatement>`).
-- `parser.*` — recursive-descent parser for `CREATE TABLE`,
-  `ALTER TABLE ... ADD COLUMN`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`,
-  `SHOW TABLES`. `WHERE` is limited to an AND-chain of `column <op> literal`
-  comparisons — no `OR`, no subqueries, no `JOIN`.
-- `schema.*` — a table's column list, persisted at key `__schema__/<table>`
-  via the storage engine (length-prefixed binary encoding, since a column's
-  `DEFAULT` literal can hold arbitrary bytes the way column names can't), so
-  schemas survive restarts the same way rows do.
+  AlterTableAddColumnStatement, ShowTablesStatement, CreateDatabaseStatement,
+  ShowDatabasesStatement>`).
+- `parser.*` — recursive-descent parser for `CREATE DATABASE`,
+  `CREATE TABLE`, `ALTER TABLE ... ADD COLUMN`, `INSERT`, `SELECT`,
+  `UPDATE`, `DELETE`, `SHOW TABLES`, `SHOW DATABASES`. `WHERE` is limited
+  to an AND-chain of `column <op> literal` comparisons — no `OR`, no
+  subqueries, no `JOIN`.
+- `schema.*` — a table's column list, persisted at key
+  `__schema__/<database>/<table>` via the storage engine (length-prefixed
+  binary encoding, since a column's `DEFAULT` literal can hold arbitrary
+  bytes the way column names can't), so schemas survive restarts the same
+  way rows do.
 - `executor.*` — executes a parsed statement: rows are stored at key
-  `__row__/<table>/<primary-key-value>`, encoded as length-prefixed fields
-  (`EncodeRow`/`DecodeRow`) since column values can hold arbitrary bytes
-  (unlike column names, which the schema's simpler delimited format assumes
-  are plain identifiers). `SELECT`/`UPDATE`/`DELETE` scan every row under a
-  table's key prefix via `StorageEngine::Scan` — there is no secondary
-  indexing yet, so a filter on a non-primary-key column still reads the
-  whole table.
+  `__row__/<database>/<table>/<primary-key-value>`, encoded as
+  length-prefixed fields (`EncodeRow`/`DecodeRow`) since column values can
+  hold arbitrary bytes (unlike column names, which the schema's simpler
+  delimited format assumes are plain identifiers). `SELECT`/`UPDATE`/
+  `DELETE` scan every row under a table's key prefix via
+  `StorageEngine::Scan` — there is no secondary indexing yet, so a filter
+  on a non-primary-key column still reads the whole table.
 
 Supported column types are `TEXT` and `INT` only; every table needs exactly
 one `PRIMARY KEY` column; `INSERT` must specify every column (no `NULL`s,
 no partial rows); updating the primary key column is rejected (it would
 require moving the row to a new key, not just rewriting it in place).
 
-`ALTER TABLE <table> ADD COLUMN <name> <type> DEFAULT <literal>` adds a
+Every table reference (`CREATE`/`ALTER TABLE`, `INSERT INTO`, `... FROM`,
+`UPDATE`, `DELETE FROM`, `SHOW TABLES FROM`) must be written
+`<database>.<table>` — there is no `USE <database>`/current-database
+concept, and this is deliberate, not an oversight: every statement this
+project ever proposes through Raft is replicated as plain opaque text with
+nothing else recorded alongside it (the same underlying reason `INSERT`
+can't have implicit/partial columns either — see `InsertStatement`'s own
+comment). A bare, unqualified table name would have to resolve against
+some ambient "current database" state, but a follower applying that text
+later has no session to resolve it against, and two different connections
+could disagree about "current database" for the exact same text.
+Qualifying every reference inline sidesteps the question entirely - the
+command means the same thing to everyone who ever reads it back, forever.
+`CREATE DATABASE <name>` itself needs no qualification (a database *is*
+the thing being named); it just writes a `__database__/<name>` marker key
+that `CREATE TABLE`/`ALTER TABLE ADD COLUMN` check for before allowing a
+table into that database.
+
+`ALTER TABLE <database>.<table> ADD COLUMN <name> <type> DEFAULT <literal>` adds a
 column without touching existing rows up front - `DEFAULT` is mandatory
 (there's no `NULL` in this project, so a pre-existing row has to read back
 as *something* for a column it predates) rather than optional the way real
@@ -77,18 +98,23 @@ after the `ALTER` - the padding is only ever a *read-time* fallback for
 whatever's still on disk in its pre-`ALTER` shape, not a permanent
 distinction between "old" and "new" rows.
 
-`SHOW TABLES` lists every table's name - unlike a row-data `SELECT` with no
-`WHERE` (which needs every shard scattered and merged, since shards own
-disjoint *rows*), every shard already holds an identical copy of every
-table's *schema* (that's exactly what broadcasting `CREATE`/`ALTER TABLE`
-to every shard guarantees), so asking this node's own shard alone is
-already the complete, correct answer - no scatter/gather needed. Routed
-and executed exactly like a `SELECT` otherwise (a read, not a Raft
-proposal): `raft_main.cpp` answers it locally without forwarding, and
-`raftui` sends it via `SendReadRequest` to whichever peer answers first,
-rendering the result as the same bordered table a `SELECT` gets (its
-output is a `SELECT`-shaped one-column table, header `table` then one row
-per table name).
+`SHOW TABLES FROM <database>` lists every table's name in that database -
+`FROM` is mandatory for the same reason every other table reference must
+be qualified (see above). Unlike a row-data `SELECT` with no `WHERE`
+(which needs every shard scattered and merged, since shards own disjoint
+*rows*), every shard already holds an identical copy of every database's
+tables' *schemas* (that's exactly what broadcasting `CREATE DATABASE`/
+`CREATE`/`ALTER TABLE` to every shard guarantees), so asking this node's
+own shard alone is already the complete, correct answer - no scatter/
+gather needed. `SHOW DATABASES` lists every database's name the same way -
+the one statement in this SQL subset that takes no qualification at all,
+since a database *is* the thing being named. Both are routed and executed
+exactly like a `SELECT` otherwise (a read, not a Raft proposal):
+`raft_main.cpp` answers them locally without forwarding, and `raftui`
+sends them via `SendReadRequest` to whichever peer answers first,
+rendering the result as the same bordered table a `SELECT` gets (each
+output is a `SELECT`-shaped one-column table: header `table` or
+`database`, then one row per name).
 
 ### Raft layer (`src/raft/`) — Phase 2: election, heartbeats, and real log replication
 
@@ -281,9 +307,10 @@ so both limits scale with the number of shards instead of staying fixed.
   returns the exact row key it touches if that's determinable without a
   full table scan: an `INSERT` (the primary key value is right there in the
   statement) or a `SELECT`/`UPDATE`/`DELETE` whose `WHERE` pins the primary
-  key with `=`. Returns nothing for `CREATE TABLE`/`ALTER TABLE` (it's
-  schema, not a row - see below) or a `WHERE` that doesn't pin the primary
-  key (a full table scan, e.g. no filter or one on a non-key column) -
+  key with `=`. Returns nothing for `CREATE DATABASE`/`CREATE TABLE`/
+  `ALTER TABLE`/`SHOW TABLES`/`SHOW DATABASES` (it's schema, not a row -
+  see below) or a `WHERE` that doesn't pin the primary key (a full table
+  scan, e.g. no filter or one on a non-key column) -
   `raft_main.cpp` must then decide what to do without a single shard to
   route to.
 - `raft/client.h/.cpp` - `SendClientRequest`/`SendReadRequest`: standalone
@@ -300,8 +327,9 @@ so both limits scale with the number of shards instead of staying fixed.
 - `raft_main.cpp` dispatch: `raftnode <node-id> <shard-id> <port>
   <routing-table-path> [state-dir]` - a node's peers now come from the
   routing table (`Shard(shard_id).peers`, minus itself) instead of a
-  separate CLI argument. `CREATE TABLE`/`ALTER TABLE` are DDL, not row data -
-  any shard could end up holding rows for that table, so each is proposed
+  separate CLI argument. `CREATE DATABASE`/`CREATE TABLE`/`ALTER TABLE` are
+  DDL, not row data - any shard could end up holding rows for that table
+  (or a table in that database), so each is proposed
   to *every* shard via a loop (locally through `ProposeOrForward` for this
   node's own shard, `SendClientRequest` for the rest), not routed to just
   one. Everything else calls `TryExtractRowKey` first: if it returns a key,
@@ -588,8 +616,8 @@ separately-built Qt package would have) and calls the exact same
 `SendClientRequest`/`SendReadRequest` (`src/raft/client.h`) the REPL itself
 uses for talking to a single shard, plus the same SQL parser
 (`distdb::Tokenize`/`Parser::ParseStatement`) to decide read vs. write the
-same way `raft_main.cpp` does. **Not** in scope: `CREATE TABLE`/
-`ALTER TABLE` broadcast-to-every-shard, cross-shard scatter/gather, or 2PC
+same way `raft_main.cpp` does. **Not** in scope: `CREATE DATABASE`/
+`CREATE TABLE`/`ALTER TABLE` broadcast-to-every-shard, cross-shard scatter/gather, or 2PC
 transactions - those are orchestration logic that only exists inside `raft_main.cpp`'s
 `main()` today, not reusable library calls; and no live status (role/term/
 leader) panel, since the network protocol (`message.h`) has no remote
@@ -622,11 +650,20 @@ as before this feature existed.
 one node's `host:port` into "Seed node" and click "Discover" to
 auto-fill "Peers", or enter that shard's peers directly in the "Peers"
 field using the same `id=host:port,id=host:port` syntax as
-`routing.conf`. Then type SQL/REPL statements into the command box and
-press Enter or click Send - responses (or errors) accumulate in the
-output panel above it, exactly like a REPL transcript. The "Tables"
-button next to Send is a shortcut for typing `SHOW TABLES` yourself -
-same result, same rendering, just one click.
+`routing.conf`. The "Database" field plus "Databases"/"Tables" buttons are
+a convenience for `SHOW DATABASES`/`SHOW TABLES FROM <db>` specifically -
+"Databases" always works, "Tables" qualifies itself with whatever's typed
+in "Database" (and errors immediately, without a round trip, if that's
+empty). This is deliberately the *only* place raftui does anything with
+that field - every table reference you type in the command box below
+still has to spell out `<database>.<table>` itself; raftui never splices
+"Database" into arbitrary typed SQL, since guessing at SQL structure the
+parser hasn't validated yet is exactly the kind of implicit-state
+shortcut this project's mandatory qualification (see the SQL layer
+section above) avoids server-side, and doing it client-side instead
+wouldn't really be different. Then type SQL/REPL statements into the
+command box and press Enter or click Send - responses (or errors)
+accumulate in the output panel above it, exactly like a REPL transcript.
 
 ## Build
 
@@ -660,17 +697,19 @@ build/distdb.exe [data-dir]
 `*.sst` files. Data survives restarts:
 
 ```
-> CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, age INT)
+> CREATE DATABASE mydb
 OK
-> INSERT INTO users (id, name, age) VALUES ('u1', 'Alice', 30)
+> CREATE TABLE mydb.users (id TEXT PRIMARY KEY, name TEXT, age INT)
 OK
-> SELECT * FROM users WHERE age > 20
+> INSERT INTO mydb.users (id, name, age) VALUES ('u1', 'Alice', 30)
+OK
+> SELECT * FROM mydb.users WHERE age > 20
 id	name	age
 u1	Alice	30
 > exit
 ```
 ```
-> SELECT * FROM users
+> SELECT * FROM mydb.users
 id	name	age
 u1	Alice	30
 ```

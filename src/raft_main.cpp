@@ -127,20 +127,24 @@ void PrintClientResponse(const distdb::ClientResponse& resp) {
 }
 
 void PrintHelp() {
-    std::cout << "Enter SQL statements (CREATE TABLE / ALTER TABLE ADD COLUMN / INSERT /\n"
-                 "SELECT / UPDATE / DELETE / SHOW TABLES). CREATE TABLE and ALTER TABLE are\n"
-                 "broadcast to every shard. INSERT, and any SELECT/UPDATE/DELETE whose WHERE\n"
-                 "pins the primary key with '=', is routed to the one shard that owns it\n"
-                 "(replicated through Raft the same as a single-shard cluster, forwarding\n"
-                 "over the network first if that shard isn't this node's). Anything else (no\n"
-                 "WHERE <pk> = ...) is scattered to every shard and the results/counts\n"
-                 "gathered back into one answer. SHOW TABLES only ever asks this node's own\n"
-                 "shard - every shard's schema copy is already identical.\n"
+    std::cout << "Enter SQL statements (CREATE DATABASE / CREATE TABLE / ALTER TABLE ADD\n"
+                 "COLUMN / INSERT / SELECT / UPDATE / DELETE / SHOW TABLES / SHOW DATABASES).\n"
+                 "Every table reference must be written <database>.<table> - there's no\n"
+                 "current/default database (see CREATE DATABASE). CREATE/ALTER TABLE and\n"
+                 "CREATE DATABASE are broadcast to every shard. INSERT, and any\n"
+                 "SELECT/UPDATE/DELETE whose WHERE pins the primary key with '=', is routed to\n"
+                 "the one shard that owns it (replicated through Raft the same as a\n"
+                 "single-shard cluster, forwarding over the network first if that shard isn't\n"
+                 "this node's). Anything else (no WHERE <pk> = ...) is scattered to every\n"
+                 "shard and the results/counts gathered back into one answer. SHOW\n"
+                 "TABLES/DATABASES only ever ask this node's own shard - every shard's schema\n"
+                 "copy is already identical.\n"
                  "\n"
                  "  begin              start a transaction: buffers writes instead of running\n"
                  "                     them, until commit/rollback. Only INSERT/UPDATE/DELETE\n"
                  "                     whose WHERE pins the primary key are allowed inside one\n"
-                 "                     (no CREATE/ALTER TABLE, no SELECT, no whole-table scatter).\n"
+                 "                     (no CREATE DATABASE/TABLE, no ALTER TABLE, no SELECT, no\n"
+                 "                     whole-table scatter, no SHOW TABLES/DATABASES).\n"
                  "  commit             two-phase commit every buffered statement, atomically\n"
                  "                     across however many shards they touch\n"
                  "  rollback           discard the buffer - nothing was ever sent anywhere\n"
@@ -617,16 +621,19 @@ int main(int argc, char** argv) {
                 // has no single shard to lock it against - see the
                 // scatter/gather path above for those, which already has no
                 // cross-shard atomicity story of its own to begin with.
-                if (std::holds_alternative<distdb::CreateTableStatement>(parsed) ||
+                if (std::holds_alternative<distdb::CreateDatabaseStatement>(parsed) ||
+                    std::holds_alternative<distdb::CreateTableStatement>(parsed) ||
                     std::holds_alternative<distdb::AlterTableAddColumnStatement>(parsed)) {
-                    std::cout << "ERROR: CREATE TABLE/ALTER TABLE are not supported inside a transaction\n";
+                    std::cout << "ERROR: CREATE DATABASE/TABLE and ALTER TABLE are not supported inside a "
+                                 "transaction\n";
                     continue;
                 }
                 if (std::holds_alternative<distdb::SelectStatement>(parsed) ||
-                    std::holds_alternative<distdb::ShowTablesStatement>(parsed)) {
-                    std::cout << "ERROR: SELECT/SHOW TABLES are not supported inside a transaction (writes are "
-                                 "staged, not applied, until commit - a read here could never see them anyway); "
-                                 "run it before begin or after commit/rollback\n";
+                    std::holds_alternative<distdb::ShowTablesStatement>(parsed) ||
+                    std::holds_alternative<distdb::ShowDatabasesStatement>(parsed)) {
+                    std::cout << "ERROR: SELECT/SHOW TABLES/SHOW DATABASES are not supported inside a transaction "
+                                 "(writes are staged, not applied, until commit - a read here could never see them "
+                                 "anyway); run it before begin or after commit/rollback\n";
                     continue;
                 }
                 auto key = sql.TryExtractRowKey(parsed);
@@ -645,6 +652,13 @@ int main(int argc, char** argv) {
                 continue;
             }
 
+            if (std::holds_alternative<distdb::CreateDatabaseStatement>(parsed)) {
+                // A table in this database could end up on any shard, so
+                // every shard needs to agree the database exists too -
+                // same reasoning as CREATE TABLE below, just one level up.
+                PrintBroadcastResult(BroadcastWrite(routing, node, shard_id, line, kCrossShardTimeoutMs), "created");
+                continue;
+            }
             if (std::holds_alternative<distdb::CreateTableStatement>(parsed)) {
                 // Schema is DDL, not row data - any shard could end up
                 // holding rows for this table, so every shard needs an
@@ -660,14 +674,15 @@ int main(int argc, char** argv) {
                 PrintBroadcastResult(BroadcastWrite(routing, node, shard_id, line, kCrossShardTimeoutMs), "altered");
                 continue;
             }
-            if (std::holds_alternative<distdb::ShowTablesStatement>(parsed)) {
+            if (std::holds_alternative<distdb::ShowTablesStatement>(parsed) ||
+                std::holds_alternative<distdb::ShowDatabasesStatement>(parsed)) {
                 // The opposite of CREATE/ALTER TABLE above: a read, and
                 // every shard already has an identical copy of every
-                // table's schema (that's exactly what broadcasting CREATE/
-                // ALTER TABLE guarantees), so this node's own shard alone
-                // already has the complete, correct answer - no need to
-                // scatter to every shard and merge like a row-data SELECT
-                // with no WHERE would need.
+                // database/table's schema (that's exactly what broadcasting
+                // CREATE DATABASE/CREATE/ALTER TABLE guarantees), so this
+                // node's own shard alone already has the complete, correct
+                // answer - no need to scatter to every shard and merge like
+                // a row-data SELECT with no WHERE would need.
                 try {
                     std::lock_guard<std::mutex> lock(engine_mutex);
                     std::cout << sql.Execute(line) << "\n";

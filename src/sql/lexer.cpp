@@ -25,17 +25,19 @@ std::vector<Token> Tokenize(const std::string& sql) {
             continue;
         }
 
+        size_t token_start = i;  // where the token about to be pushed below started
+
         if (IsIdentStart(c)) {
             size_t start = i;
             while (i < n && IsIdentChar(sql[i])) i++;
-            tokens.push_back({TokenType::kIdentifier, sql.substr(start, i - start)});
+            tokens.push_back({TokenType::kIdentifier, sql.substr(start, i - start), token_start});
             continue;
         }
 
         if (std::isdigit(static_cast<unsigned char>(c))) {
             size_t start = i;
             while (i < n && std::isdigit(static_cast<unsigned char>(sql[i]))) i++;
-            tokens.push_back({TokenType::kNumber, sql.substr(start, i - start)});
+            tokens.push_back({TokenType::kNumber, sql.substr(start, i - start), token_start});
             continue;
         }
 
@@ -43,7 +45,7 @@ std::vector<Token> Tokenize(const std::string& sql) {
             size_t start = i;
             i++;
             while (i < n && std::isdigit(static_cast<unsigned char>(sql[i]))) i++;
-            tokens.push_back({TokenType::kNumber, sql.substr(start, i - start)});
+            tokens.push_back({TokenType::kNumber, sql.substr(start, i - start), token_start});
             continue;
         }
 
@@ -64,33 +66,34 @@ std::vector<Token> Tokenize(const std::string& sql) {
                 value.push_back(sql[i]);
                 i++;
             }
-            tokens.push_back({TokenType::kString, value});
+            tokens.push_back({TokenType::kString, value, token_start});
             continue;
         }
 
         if (c == '<' && i + 1 < n && sql[i + 1] == '=') {
-            tokens.push_back({TokenType::kSymbol, "<="});
+            tokens.push_back({TokenType::kSymbol, "<=", token_start});
             i += 2;
             continue;
         }
         if (c == '>' && i + 1 < n && sql[i + 1] == '=') {
-            tokens.push_back({TokenType::kSymbol, ">="});
+            tokens.push_back({TokenType::kSymbol, ">=", token_start});
             i += 2;
             continue;
         }
         if (c == '!' && i + 1 < n && sql[i + 1] == '=') {
-            tokens.push_back({TokenType::kSymbol, "!="});
+            tokens.push_back({TokenType::kSymbol, "!=", token_start});
             i += 2;
             continue;
         }
         if (c == '<' && i + 1 < n && sql[i + 1] == '>') {  // <> is standard SQL for !=
-            tokens.push_back({TokenType::kSymbol, "!="});
+            tokens.push_back({TokenType::kSymbol, "!=", token_start});
             i += 2;
             continue;
         }
 
-        if (c == '(' || c == ')' || c == ',' || c == ';' || c == '*' || c == '=' || c == '<' || c == '>') {
-            tokens.push_back({TokenType::kSymbol, std::string(1, c)});
+        if (c == '(' || c == ')' || c == ',' || c == ';' || c == '*' || c == '=' || c == '<' || c == '>' ||
+            c == '.') {
+            tokens.push_back({TokenType::kSymbol, std::string(1, c), token_start});
             i++;
             continue;
         }
@@ -98,7 +101,7 @@ std::vector<Token> Tokenize(const std::string& sql) {
         throw std::runtime_error(std::string("unexpected character in SQL: '") + c + "'");
     }
 
-    tokens.push_back({TokenType::kEnd, ""});
+    tokens.push_back({TokenType::kEnd, "", n});
     return tokens;
 }
 
